@@ -30,6 +30,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.logging.Logger;
 import okhttp3.Protocol;
 import okhttp3.internal.NamedRunnable;
 import okhttp3.internal.Util;
@@ -216,7 +217,7 @@ public final class Http2Connection implements Closeable {
     synchronized (writer) {
       synchronized (this) {
         if (shutdown) {
-          throw new IOException("shutdown");
+          throw new ConnectionShutdownException();
         }
         streamId = nextStreamId;
         nextStreamId += 2;
@@ -335,7 +336,7 @@ public final class Http2Connection implements Closeable {
     int pingId;
     synchronized (this) {
       if (shutdown) {
-        throw new IOException("shutdown");
+        throw new ConnectionShutdownException();
       }
       pingId = nextPingId;
       nextPingId += 2;
@@ -426,6 +427,8 @@ public final class Http2Connection implements Closeable {
     }
 
     if (streamsToClose != null) {
+      Logger.getLogger(Http2Connection.class.getName()).warning(
+          "found http/2 stream to close, client=" + client);
       for (Http2Stream stream : streamsToClose) {
         try {
           stream.close(streamCode);
@@ -482,12 +485,16 @@ public final class Http2Connection implements Closeable {
     new Thread(readerRunnable).start(); // Not a daemon thread.
   }
 
+  public synchronized boolean isShutdown() {
+    return shutdown;
+  }
+
   /** Merges {@code settings} into this peer's settings and sends them to the remote peer. */
   public void setSettings(Settings settings) throws IOException {
     synchronized (writer) {
       synchronized (this) {
         if (shutdown) {
-          throw new IOException("shutdown");
+          throw new ConnectionShutdownException();
         }
         okHttpSettings.merge(settings);
         writer.settings(settings);

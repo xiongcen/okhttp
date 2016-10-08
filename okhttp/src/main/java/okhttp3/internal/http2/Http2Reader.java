@@ -109,7 +109,9 @@ final class Http2Reader implements Closeable {
     byte type = (byte) (source.readByte() & 0xff);
     byte flags = (byte) (source.readByte() & 0xff);
     int streamId = (source.readInt() & 0x7fffffff); // Ignore reserved bit.
-    if (logger.isLoggable(FINE)) logger.fine(frameLog(true, streamId, length, type, flags));
+    if (logger.isLoggable(FINE) && client) {
+      logger.fine(frameLog(true, streamId, length, type, flags));
+    }
 
     switch (type) {
       case TYPE_DATA:

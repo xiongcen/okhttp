@@ -30,6 +30,7 @@ import okhttp3.Call;
 import okhttp3.Cookie;
 import okhttp3.Credentials;
 import okhttp3.Headers;
+import okhttp3.Interceptor;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Protocol;
@@ -803,6 +804,33 @@ public final class HttpOverHttp2Test {
     assertEquals(1, server.takeRequest().getSequenceNumber()); // Reuse settings connection.
     assertEquals(2, server.takeRequest().getSequenceNumber()); // Reuse settings connection.
     assertEquals(0, server.takeRequest().getSequenceNumber()); // New connection!
+  }
+
+  @Test public void connectionsThrowingIoExceptionNotReused() throws Exception {
+    // Ensure that the (shared) connection pool is in a consistent state.
+    client.connectionPool().evictAll();
+
+    client = client.newBuilder()
+        .addNetworkInterceptor(new Interceptor() {
+          @Override public Response intercept(Chain chain) throws IOException {
+            throw new IOException("Mock Stream Closed");
+          }
+        })
+        .build();
+
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (IOException expected) {
+      assertEquals("Mock Stream Closed", expected.getMessage());
+    }
+
+    assertEquals(0, client.connectionPool().connectionCount());
+    assertEquals(0, client.connectionPool().idleConnectionCount());
   }
 
   public Buffer gzip(String bytes) throws IOException {

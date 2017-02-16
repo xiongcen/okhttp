@@ -39,6 +39,7 @@ public final class ConnectInterceptor implements Interceptor {
 
     // We need the network to satisfy this request. Possibly for validating a conditional GET.
     boolean doExtensiveHealthChecks = !request.method().equals("GET");
+    // 找到一个可用的 RealConnection，再利用 RealConnection 的输入输出（BufferedSource 和 BufferedSink）创建 HttpCodec 对象
     HttpCodec httpCodec = streamAllocation.newStream(client, doExtensiveHealthChecks);
     RealConnection connection = streamAllocation.connection();
 

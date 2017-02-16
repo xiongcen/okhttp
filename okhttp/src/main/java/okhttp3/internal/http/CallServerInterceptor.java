@@ -40,8 +40,10 @@ public final class CallServerInterceptor implements Interceptor {
     Request request = chain.request();
 
     long sentRequestMillis = System.currentTimeMillis();
+    // 1.向服务器发送 request header；
     httpCodec.writeRequestHeaders(request);
 
+    // 2.如果有 request body，就向服务器发送；
     if (HttpMethod.permitsRequestBody(request.method()) && request.body() != null) {
       Sink requestBodyOut = httpCodec.createRequestBody(request, request.body().contentLength());
       BufferedSink bufferedRequestBody = Okio.buffer(requestBodyOut);
@@ -51,6 +53,7 @@ public final class CallServerInterceptor implements Interceptor {
 
     httpCodec.finishRequest();
 
+    // 3.读取 response header，先构造一个 Response 对象；
     Response response = httpCodec.readResponseHeaders()
         .request(request)
         .handshake(streamAllocation.connection().handshake())
@@ -65,6 +68,7 @@ public final class CallServerInterceptor implements Interceptor {
           .body(Util.EMPTY_RESPONSE)
           .build();
     } else {
+      // 4.如果有 response body，就在 步骤3 的基础上加上 body 构造一个新的 Response 对象；
       response = response.newBuilder()
           .body(httpCodec.openResponseBody(response))
           .build();

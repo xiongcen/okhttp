@@ -48,6 +48,7 @@ public final class BridgeInterceptor implements Interceptor {
     Request userRequest = chain.request();
     Request.Builder requestBuilder = userRequest.newBuilder();
 
+    // 检查request。将用户的request转换为发送到server的请求
     RequestBody body = userRequest.body();
     if (body != null) {
       MediaType contentType = body.contentType();
@@ -90,6 +91,7 @@ public final class BridgeInterceptor implements Interceptor {
       requestBuilder.header("User-Agent", Version.userAgent());
     }
 
+    // 调用下一个 interceptor 来得到response
     Response networkResponse = chain.proceed(requestBuilder.build());
 
     HttpHeaders.receiveHeaders(cookieJar, userRequest.url(), networkResponse.headers());

@@ -52,18 +52,27 @@ final class RealCall implements Call {
     return originalRequest;
   }
 
+  /**
+   * 同步网络请求
+   * @return
+   * @throws IOException
+     */
   @Override public Response execute() throws IOException {
     synchronized (this) {
+      // 检查这个 call 是否已经被执行了，每个 call 只能被执行一次，如果想要一个完全一样的 call，可以利用 call#clone 方法进行克隆。
       if (executed) throw new IllegalStateException("Already Executed");
       executed = true;
     }
     captureCallStackTrace();
     try {
+      // 利用 client.dispatcher().executed(this) 来进行实际执行，dispatcher 是 OkHttpClient.Builder 的成员之一。
       client.dispatcher().executed(this);
+      // 调用 getResponseWithInterceptorChain() 函数获取 HTTP 返回结果，从函数名可以看出，这一步还会进行一系列“拦截”操作。
       Response result = getResponseWithInterceptorChain();
       if (result == null) throw new IOException("Canceled");
       return result;
     } finally {
+      // 通知 dispatcher 自己已经执行完毕。
       client.dispatcher().finished(this);
     }
   }
@@ -161,17 +170,24 @@ final class RealCall implements Call {
     return originalRequest.url().redact().toString();
   }
 
+  // OKHttp的变化历程：https://publicobject.com/2016/07/03/the-last-httpurlconnection/
   Response getResponseWithInterceptorChain() throws IOException {
     // Build a full stack of interceptors.
     List<Interceptor> interceptors = new ArrayList<>();
     interceptors.addAll(client.interceptors());
+    // 负责失败重试以及重定向的 RetryAndFollowUpInterceptor；
     interceptors.add(retryAndFollowUpInterceptor);
+    // 负责把用户构造的请求转换为发送到服务器的请求、把服务器返回的响应转换为用户友好的响应的 BridgeInterceptor；
     interceptors.add(new BridgeInterceptor(client.cookieJar()));
+    // 负责读取缓存直接返回、更新缓存的 CacheInterceptor；
     interceptors.add(new CacheInterceptor(client.internalCache()));
+    // 负责和服务器建立连接的 ConnectInterceptor；
     interceptors.add(new ConnectInterceptor(client));
+    // 配置 OkHttpClient 时设置的 networkInterceptors；
     if (!forWebSocket) {
       interceptors.addAll(client.networkInterceptors());
     }
+    // 负责向服务器发送请求数据、从服务器读取响应数据的 CallServerInterceptor。
     interceptors.add(new CallServerInterceptor(forWebSocket));
 
     Interceptor.Chain chain = new RealInterceptorChain(

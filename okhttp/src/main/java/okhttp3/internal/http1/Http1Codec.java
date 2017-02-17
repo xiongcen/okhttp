@@ -188,13 +188,15 @@ public final class Http1Codec implements HttpCodec {
 
     try {
       while (true) {
+        // 1.从InputStream上读入一行数据
         StatusLine statusLine = StatusLine.parse(source.readUtf8LineStrict());
 
         Response.Builder responseBuilder = new Response.Builder()
             .protocol(statusLine.protocol)
             .code(statusLine.code)
             .message(statusLine.message)
-            .headers(readHeaders());
+                // 读取ResponseHeader
+                .headers(readHeaders());
 
         if (statusLine.code != HTTP_CONTINUE) {
           state = STATE_OPEN_RESPONSE_BODY;

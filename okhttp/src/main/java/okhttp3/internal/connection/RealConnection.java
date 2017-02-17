@@ -170,7 +170,9 @@ public final class RealConnection extends Http2Connection.Listener implements Co
   /** Does all the work necessary to build a full HTTP or HTTPS connection on a raw socket. */
   private void buildConnection(int connectTimeout, int readTimeout, int writeTimeout,
       ConnectionSpecSelector connectionSpecSelector) throws IOException {
+    // 连接socket
     connectSocket(connectTimeout, readTimeout);
+    // 根据HTTP协议版本做一些不同的事情
     establishProtocol(readTimeout, writeTimeout, connectionSpecSelector);
   }
 
@@ -190,6 +192,7 @@ public final class RealConnection extends Http2Connection.Listener implements Co
       ce.initCause(e);
       throw ce;
     }
+    // 用Okio封装了socket的输入和输出流
     source = Okio.buffer(Okio.source(rawSocket));
     sink = Okio.buffer(Okio.sink(rawSocket));
   }

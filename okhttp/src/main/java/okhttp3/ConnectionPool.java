@@ -118,9 +118,9 @@ public final class ConnectionPool {
     assert (Thread.holdsLock(this));
     for (RealConnection connection : connections) {
       if (connection.allocations.size() < connection.allocationLimit
-          && address.equals(connection.route().address)
+          && address.equals(connection.route().address)// 根据url命中connection
           && !connection.noNewStreams) {
-        streamAllocation.acquire(connection);
+        streamAllocation.acquire(connection);// 将可用的连接放入
         return connection;
       }
     }

@@ -107,6 +107,7 @@ public final class StreamAllocation {
         resultConnection.socket().setSoTimeout(readTimeout);
         resultConnection.source.timeout().timeout(readTimeout, MILLISECONDS);
         resultConnection.sink.timeout().timeout(writeTimeout, MILLISECONDS);
+        // 构建HttpCodec
         resultCodec = new Http1Codec(
             client, this, resultConnection.source, resultConnection.sink);
       }
@@ -167,6 +168,7 @@ public final class StreamAllocation {
       }
 
       // Attempt to get a connection from the pool.
+      // 从线程池中获取连接
       RealConnection pooledConnection = Internal.instance.get(connectionPool, address, this);
       if (pooledConnection != null) {
         this.connection = pooledConnection;
@@ -176,6 +178,7 @@ public final class StreamAllocation {
       selectedRoute = route;
     }
 
+    // 如果selectedRoute为空，则选择下一条路由Route
     if (selectedRoute == null) {
       selectedRoute = routeSelector.next();
       synchronized (connectionPool) {
@@ -183,15 +186,18 @@ public final class StreamAllocation {
         refusedStreamCount = 0;
       }
     }
+    // 以前面创建的route为参数新建一个RealConnection
     RealConnection newConnection = new RealConnection(selectedRoute);
 
     synchronized (connectionPool) {
       acquire(newConnection);
+      // 加入连接池
       Internal.instance.put(connectionPool, newConnection);
       this.connection = newConnection;
       if (canceled) throw new IOException("Canceled");
     }
 
+    // 调用RealConnection的connect()方法，实际上是buildConnection()构建连接。
     newConnection.connect(connectTimeout, readTimeout, writeTimeout, address.connectionSpecs(),
         connectionRetryEnabled);
     routeDatabase().connected(newConnection.route());

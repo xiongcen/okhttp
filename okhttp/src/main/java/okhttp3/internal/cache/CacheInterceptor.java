@@ -133,10 +133,21 @@ public final class CacheInterceptor implements Interceptor {
         .networkResponse(stripBody(networkResponse))
         .build();
 
-    // 请求有body内容，则判断是否需要缓存
-    if (HttpHeaders.hasBody(response)) {
-      CacheRequest cacheRequest = maybeCache(response, networkResponse.request(), cache);
-      response = cacheWritingResponse(cacheRequest, response);
+    if (cache != null) {
+        // 请求有body内容，则判断是否需要缓存
+      if (HttpHeaders.hasBody(response) && CacheStrategy.isCacheable(response, networkRequest)) {
+        // Offer this request to the cache.
+        CacheRequest cacheRequest = cache.put(response);
+        return cacheWritingResponse(cacheRequest, response);
+      }
+
+      if (HttpMethod.invalidatesCache(networkRequest.method())) {
+        try {
+          cache.remove(networkRequest);
+        } catch (IOException ignored) {
+          // The cache cannot be written.
+        }
+      }
     }
 
     return response;
@@ -146,26 +157,6 @@ public final class CacheInterceptor implements Interceptor {
     return response != null && response.body() != null
         ? response.newBuilder().body(null).build()
         : response;
-  }
-
-  private CacheRequest maybeCache(Response userResponse, Request networkRequest,
-      InternalCache responseCache) throws IOException {
-    if (responseCache == null) return null;
-
-    // Should we cache this response for this request?
-    if (!CacheStrategy.isCacheable(userResponse, networkRequest)) {
-      if (HttpMethod.invalidatesCache(networkRequest.method())) {
-        try {
-          responseCache.remove(networkRequest);
-        } catch (IOException ignored) {
-          // The cache cannot be written.
-        }
-      }
-      return null;
-    }
-
-    // Offer this request to the cache.
-    return responseCache.put(userResponse);
   }
 
   /**
@@ -225,12 +216,14 @@ public final class CacheInterceptor implements Interceptor {
       }
     };
 
+    String contentType = response.header("Content-Type");
+    long contentLength = response.body().contentLength();
     return response.newBuilder()
-        .body(new RealResponseBody(response.headers(), Okio.buffer(cacheWritingSource)))
+        .body(new RealResponseBody(contentType, contentLength, Okio.buffer(cacheWritingSource)))
         .build();
   }
 
-  /** Combines cached headers with a network headers as defined by RFC 2616, 13.5.3. */
+  /** Combines cached headers with a network headers as defined by RFC 7234, 4.3.4. */
   private static Headers combine(Headers cachedHeaders, Headers networkHeaders) {
     Headers.Builder result = new Headers.Builder();
 
@@ -240,17 +233,15 @@ public final class CacheInterceptor implements Interceptor {
       if ("Warning".equalsIgnoreCase(fieldName) && value.startsWith("1")) {
         continue; // Drop 100-level freshness warnings.
       }
-      if (!isEndToEnd(fieldName) || networkHeaders.get(fieldName) == null) {
+      if (isContentSpecificHeader(fieldName) || !isEndToEnd(fieldName)
+              || networkHeaders.get(fieldName) == null) {
         Internal.instance.addLenient(result, fieldName, value);
       }
     }
 
     for (int i = 0, size = networkHeaders.size(); i < size; i++) {
       String fieldName = networkHeaders.name(i);
-      if ("Content-Length".equalsIgnoreCase(fieldName)) {
-        continue; // Ignore content-length headers of validating responses.
-      }
-      if (isEndToEnd(fieldName)) {
+      if (!isContentSpecificHeader(fieldName) && isEndToEnd(fieldName)) {
         Internal.instance.addLenient(result, fieldName, networkHeaders.value(i));
       }
     }
@@ -271,5 +262,15 @@ public final class CacheInterceptor implements Interceptor {
         && !"Trailers".equalsIgnoreCase(fieldName)
         && !"Transfer-Encoding".equalsIgnoreCase(fieldName)
         && !"Upgrade".equalsIgnoreCase(fieldName);
+  }
+
+  /**
+   * Returns true if {@code fieldName} is content specific and therefore should always be used
+   * from cached headers.
+   */
+  static boolean isContentSpecificHeader(String fieldName) {
+    return "Content-Length".equalsIgnoreCase(fieldName)
+        || "Content-Encoding".equalsIgnoreCase(fieldName)
+        || "Content-Type".equalsIgnoreCase(fieldName);
   }
 }

@@ -34,6 +34,12 @@ final class RealCall implements Call {
   final OkHttpClient client;
   final RetryAndFollowUpInterceptor retryAndFollowUpInterceptor;
 
+  /**
+   * There is a cycle between the {@link Call} and {@link EventListener} that makes this awkward.
+   * This will be set after we create the call instance then create the event listener instance.
+   */
+  private EventListener eventListener;
+
   /** The application's original request unadulterated by redirects or auth headers. */
   final Request originalRequest;
   final boolean forWebSocket;
@@ -41,11 +47,18 @@ final class RealCall implements Call {
   // Guarded by this.
   private boolean executed;
 
-  RealCall(OkHttpClient client, Request originalRequest, boolean forWebSocket) {
+  private RealCall(OkHttpClient client, Request originalRequest, boolean forWebSocket) {
     this.client = client;
     this.originalRequest = originalRequest;
     this.forWebSocket = forWebSocket;
     this.retryAndFollowUpInterceptor = new RetryAndFollowUpInterceptor(client, forWebSocket);
+  }
+
+  static RealCall newRealCall(OkHttpClient client, Request originalRequest, boolean forWebSocket) {
+    // Safely publish the Call instance to the EventListener.
+    RealCall call = new RealCall(client, originalRequest, forWebSocket);
+    call.eventListener = client.eventListenerFactory().create(call);
+    return call;
   }
 
   @Override public Request request() {
@@ -64,6 +77,7 @@ final class RealCall implements Call {
       executed = true;
     }
     captureCallStackTrace();
+    eventListener.callStart(this);
     try {
       // 利用 client.dispatcher().executed(this) 来进行实际执行，dispatcher 是 OkHttpClient.Builder 的成员之一。
       client.dispatcher().executed(this);
@@ -71,6 +85,9 @@ final class RealCall implements Call {
       Response result = getResponseWithInterceptorChain();
       if (result == null) throw new IOException("Canceled");
       return result;
+    } catch (IOException e) {
+      eventListener.callFailed(this, e);
+      throw e;
     } finally {
       // 通知 dispatcher 自己已经执行完毕。
       client.dispatcher().finished(this);
@@ -88,6 +105,7 @@ final class RealCall implements Call {
       executed = true;
     }
     captureCallStackTrace();
+    eventListener.callStart(this);
     client.dispatcher().enqueue(new AsyncCall(responseCallback));
   }
 
@@ -105,7 +123,7 @@ final class RealCall implements Call {
 
   @SuppressWarnings("CloneDoesntCallSuperClone") // We are a final type & this saves clearing state.
   @Override public RealCall clone() {
-    return new RealCall(client, originalRequest, forWebSocket);
+    return RealCall.newRealCall(client, originalRequest, forWebSocket);
   }
 
   StreamAllocation streamAllocation() {
@@ -148,6 +166,7 @@ final class RealCall implements Call {
           // Do not signal the callback twice!
           Platform.get().log(INFO, "Callback failure for " + toLoggableString(), e);
         } else {
+          eventListener.callFailed(RealCall.this, e);
           responseCallback.onFailure(RealCall.this, e);
         }
       } finally {
@@ -167,7 +186,7 @@ final class RealCall implements Call {
   }
 
   String redactedUrl() {
-    return originalRequest.url().redact().toString();
+    return originalRequest.url().redact();
   }
 
   // OKHttp的变化历程：https://publicobject.com/2016/07/03/the-last-httpurlconnection/
@@ -190,8 +209,10 @@ final class RealCall implements Call {
     // 负责向服务器发送请求数据、从服务器读取响应数据的 CallServerInterceptor。
     interceptors.add(new CallServerInterceptor(forWebSocket));
 
-    Interceptor.Chain chain = new RealInterceptorChain(
-        interceptors, null, null, null, 0, originalRequest);
+    Interceptor.Chain chain = new RealInterceptorChain(interceptors, null, null, null, 0,
+        originalRequest, this, eventListener, client.connectTimeoutMillis(),
+        client.readTimeoutMillis(), client.writeTimeoutMillis());
+
     return chain.proceed(originalRequest);
   }
 }

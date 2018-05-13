@@ -18,14 +18,12 @@ package okhttp3.logging;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.charset.Charset;
-import java.nio.charset.UnsupportedCharsetException;
 import java.util.concurrent.TimeUnit;
 import okhttp3.Connection;
 import okhttp3.Headers;
 import okhttp3.Interceptor;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
-import okhttp3.Protocol;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
@@ -34,6 +32,7 @@ import okhttp3.internal.http.HttpHeaders;
 import okhttp3.internal.platform.Platform;
 import okio.Buffer;
 import okio.BufferedSource;
+import okio.GzipSource;
 
 import static okhttp3.internal.platform.Platform.INFO;
 
@@ -152,8 +151,10 @@ public final class HttpLoggingInterceptor implements Interceptor {
     boolean hasRequestBody = requestBody != null;
 
     Connection connection = chain.connection();
-    Protocol protocol = connection != null ? connection.protocol() : Protocol.HTTP_1_1;
-    String requestStartMessage = "--> " + request.method() + ' ' + request.url() + ' ' + protocol;
+    String requestStartMessage = "--> "
+        + request.method()
+        + ' ' + request.url()
+        + (connection != null ? " " + connection.protocol() : "");
     if (!logHeaders && hasRequestBody) {
       requestStartMessage += " (" + requestBody.contentLength() + "-byte body)";
     }
@@ -182,7 +183,7 @@ public final class HttpLoggingInterceptor implements Interceptor {
 
       if (!logBody || !hasRequestBody) {
         logger.log("--> END " + request.method());
-      } else if (bodyEncoded(request.headers())) {
+      } else if (bodyHasUnknownEncoding(request.headers())) {
         logger.log("--> END " + request.method() + " (encoded body omitted)");
       } else {
         Buffer buffer = new Buffer();
@@ -219,9 +220,11 @@ public final class HttpLoggingInterceptor implements Interceptor {
     ResponseBody responseBody = response.body();
     long contentLength = responseBody.contentLength();
     String bodySize = contentLength != -1 ? contentLength + "-byte" : "unknown-length";
-    logger.log("<-- " + response.code() + ' ' + response.message() + ' '
-        + response.request().url() + " (" + tookMs + "ms" + (!logHeaders ? ", "
-        + bodySize + " body" : "") + ')');
+    logger.log("<-- "
+        + response.code()
+        + (response.message().isEmpty() ? "" : ' ' + response.message())
+        + ' ' + response.request().url()
+        + " (" + tookMs + "ms" + (!logHeaders ? ", " + bodySize + " body" : "") + ')');
 
     if (logHeaders) {
       Headers headers = response.headers();
@@ -231,25 +234,32 @@ public final class HttpLoggingInterceptor implements Interceptor {
 
       if (!logBody || !HttpHeaders.hasBody(response)) {
         logger.log("<-- END HTTP");
-      } else if (bodyEncoded(response.headers())) {
+      } else if (bodyHasUnknownEncoding(response.headers())) {
         logger.log("<-- END HTTP (encoded body omitted)");
       } else {
         BufferedSource source = responseBody.source();
         source.request(Long.MAX_VALUE); // Buffer the entire body.
         Buffer buffer = source.buffer();
 
+        Long gzippedLength = null;
+        if ("gzip".equalsIgnoreCase(headers.get("Content-Encoding"))) {
+          gzippedLength = buffer.size();
+          GzipSource gzippedResponseBody = null;
+          try {
+            gzippedResponseBody = new GzipSource(buffer.clone());
+            buffer = new Buffer();
+            buffer.writeAll(gzippedResponseBody);
+          } finally {
+            if (gzippedResponseBody != null) {
+              gzippedResponseBody.close();
+            }
+          }
+        }
+
         Charset charset = UTF8;
         MediaType contentType = responseBody.contentType();
         if (contentType != null) {
-          try {
-            charset = contentType.charset(UTF8);
-          } catch (UnsupportedCharsetException e) {
-            logger.log("");
-            logger.log("Couldn't decode the response body; charset is likely malformed.");
-            logger.log("<-- END HTTP");
-
-            return response;
-          }
+          charset = contentType.charset(UTF8);
         }
 
         if (!isPlaintext(buffer)) {
@@ -263,7 +273,12 @@ public final class HttpLoggingInterceptor implements Interceptor {
           logger.log(buffer.clone().readString(charset));
         }
 
-        logger.log("<-- END HTTP (" + buffer.size() + "-byte body)");
+        if (gzippedLength != null) {
+            logger.log("<-- END HTTP (" + buffer.size() + "-byte, "
+                + gzippedLength + "-gzipped-byte body)");
+        } else {
+            logger.log("<-- END HTTP (" + buffer.size() + "-byte body)");
+        }
       }
     }
 
@@ -294,8 +309,10 @@ public final class HttpLoggingInterceptor implements Interceptor {
     }
   }
 
-  private boolean bodyEncoded(Headers headers) {
+  private boolean bodyHasUnknownEncoding(Headers headers) {
     String contentEncoding = headers.get("Content-Encoding");
-    return contentEncoding != null && !contentEncoding.equalsIgnoreCase("identity");
+    return contentEncoding != null
+        && !contentEncoding.equalsIgnoreCase("identity")
+        && !contentEncoding.equalsIgnoreCase("gzip");
   }
 }

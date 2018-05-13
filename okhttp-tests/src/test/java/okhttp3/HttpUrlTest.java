@@ -29,7 +29,6 @@ import org.junit.Test;
 
 import static java.util.Collections.singletonList;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.fail;
 
@@ -129,9 +128,9 @@ public final class HttpUrlTest {
     HttpUrl baseWithPasswordAndUsername = HttpUrl.parse("http://username:password@host/a/b#fragment");
     HttpUrl baseWithUsernameOnly = HttpUrl.parse("http://username@host/a/b#fragment");
     HttpUrl baseWithPasswordOnly = HttpUrl.parse("http://password@host/a/b#fragment");
-    assertEquals(HttpUrl.parse("http://host/..."), baseWithPasswordAndUsername.redact());
-    assertEquals(HttpUrl.parse("http://host/..."), baseWithUsernameOnly.redact());
-    assertEquals(HttpUrl.parse("http://host/..."), baseWithPasswordOnly.redact());
+    assertEquals("http://host/...", baseWithPasswordAndUsername.redact());
+    assertEquals("http://host/...", baseWithUsernameOnly.redact());
+    assertEquals("http://host/...", baseWithPasswordOnly.redact());
   }
 
   @Test public void resolveNoScheme() throws Exception {
@@ -159,6 +158,58 @@ public final class HttpUrlTest {
     assertEquals(HttpUrl.parse("http://a/ht+tp//b/"), base.resolve("ht+tp//b/"));
     assertEquals(HttpUrl.parse("http://a/ht-tp//b/"), base.resolve("ht-tp//b/"));
     assertEquals(HttpUrl.parse("http://a/ht.tp//b/"), base.resolve("ht.tp//b/"));
+  }
+
+  /** https://tools.ietf.org/html/rfc3986#section-5.4.1 */
+  @Test public void rfc3886NormalExamples() {
+    HttpUrl url = HttpUrl.parse("http://a/b/c/d;p?q");
+    assertEquals(null, url.resolve("g:h")); // No 'g:' scheme in HttpUrl.
+    assertEquals(HttpUrl.parse("http://a/b/c/g"), url.resolve("g"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g"), url.resolve("./g"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g/"), url.resolve("g/"));
+    assertEquals(HttpUrl.parse("http://a/g"), url.resolve("/g"));
+    assertEquals(HttpUrl.parse("http://g"), url.resolve("//g"));
+    assertEquals(HttpUrl.parse("http://a/b/c/d;p?y"), url.resolve("?y"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g?y"), url.resolve("g?y"));
+    assertEquals(HttpUrl.parse("http://a/b/c/d;p?q#s"), url.resolve("#s"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g#s"), url.resolve("g#s"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g?y#s"), url.resolve("g?y#s"));
+    assertEquals(HttpUrl.parse("http://a/b/c/;x"), url.resolve(";x"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g;x"), url.resolve("g;x"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g;x?y#s"), url.resolve("g;x?y#s"));
+    assertEquals(HttpUrl.parse("http://a/b/c/d;p?q"), url.resolve(""));
+    assertEquals(HttpUrl.parse("http://a/b/c/"), url.resolve("."));
+    assertEquals(HttpUrl.parse("http://a/b/c/"), url.resolve("./"));
+    assertEquals(HttpUrl.parse("http://a/b/"), url.resolve(".."));
+    assertEquals(HttpUrl.parse("http://a/b/"), url.resolve("../"));
+    assertEquals(HttpUrl.parse("http://a/b/g"), url.resolve("../g"));
+    assertEquals(HttpUrl.parse("http://a/"), url.resolve("../.."));
+    assertEquals(HttpUrl.parse("http://a/"), url.resolve("../../"));
+    assertEquals(HttpUrl.parse("http://a/g"), url.resolve("../../g"));
+  }
+
+  /** https://tools.ietf.org/html/rfc3986#section-5.4.2 */
+  @Test public void rfc3886AbnormalExamples() {
+    HttpUrl url = HttpUrl.parse("http://a/b/c/d;p?q");
+    assertEquals(HttpUrl.parse("http://a/g"), url.resolve("../../../g"));
+    assertEquals(HttpUrl.parse("http://a/g"), url.resolve("../../../../g"));
+    assertEquals(HttpUrl.parse("http://a/g"), url.resolve("/./g"));
+    assertEquals(HttpUrl.parse("http://a/g"), url.resolve("/../g"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g."), url.resolve("g."));
+    assertEquals(HttpUrl.parse("http://a/b/c/.g"), url.resolve(".g"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g.."), url.resolve("g.."));
+    assertEquals(HttpUrl.parse("http://a/b/c/..g"), url.resolve("..g"));
+    assertEquals(HttpUrl.parse("http://a/b/g"), url.resolve("./../g"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g/"), url.resolve("./g/."));
+    assertEquals(HttpUrl.parse("http://a/b/c/g/h"), url.resolve("g/./h"));
+    assertEquals(HttpUrl.parse("http://a/b/c/h"), url.resolve("g/../h"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g;x=1/y"), url.resolve("g;x=1/./y"));
+    assertEquals(HttpUrl.parse("http://a/b/c/y"), url.resolve("g;x=1/../y"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g?y/./x"), url.resolve("g?y/./x"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g?y/../x"), url.resolve("g?y/../x"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g#s/./x"), url.resolve("g#s/./x"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g#s/../x"), url.resolve("g#s/../x"));
+    assertEquals(HttpUrl.parse("http://a/b/c/g"), url.resolve("http:g")); // "http:g" also okay.
   }
 
   @Test public void parseAuthoritySlashCountDoesntMatter() throws Exception {
@@ -375,11 +426,11 @@ public final class HttpUrlTest {
     assertEquals(null, HttpUrl.parse("http://[1:]"));
     assertEquals(null, HttpUrl.parse("http://[1:::]"));
     assertEquals(null, HttpUrl.parse("http://[1:::1]"));
-    assertEquals(null, HttpUrl.parse("http://[00000:0000:0000:0000::0000:0000:0000:0001]"));
+    assertEquals(null, HttpUrl.parse("http://[0000:0000:0000:0000::0000:0000:0000:0001]"));
   }
 
   @Test public void hostIpv6AddressTooManyGroups() throws Exception {
-    assertEquals(null, HttpUrl.parse("http://[00000:0000:0000:0000:0000:0000:0000:0000:0001]"));
+    assertEquals(null, HttpUrl.parse("http://[0000:0000:0000:0000:0000:0000:0000:0000:0001]"));
   }
 
   @Test public void hostIpv6AddressTooMuchCompression() throws Exception {
@@ -390,6 +441,11 @@ public final class HttpUrlTest {
   @Test public void hostIpv6ScopedAddress() throws Exception {
     // java.net.InetAddress parses scoped addresses. These aren't valid in URLs.
     assertEquals(null, HttpUrl.parse("http://[::1%2544]"));
+  }
+
+  @Test public void hostIpv6AddressTooManyLeadingZeros() throws Exception {
+    // Guava's been buggy on this case. https://github.com/google/guava/issues/3116
+    assertEquals(null, HttpUrl.parse("http://[2001:db8:0:0:1:0:0:00001]"));
   }
 
   @Test public void hostIpv6WithIpv4Suffix() throws Exception {
@@ -440,9 +496,14 @@ public final class HttpUrlTest {
     assertEquals("a::b:0:0:0", HttpUrl.parse("http://[a:0:0:0:b:0:0:0]/").host());
     assertEquals("::a:b:0:0:0", HttpUrl.parse("http://[0:0:0:a:b:0:0:0]/").host());
     assertEquals("::a:0:0:0:b", HttpUrl.parse("http://[0:0:0:a:0:0:0:b]/").host());
-    assertEquals("::a:b:c:d:e:f:1", HttpUrl.parse("http://[0:a:b:c:d:e:f:1]/").host());
-    assertEquals("a:b:c:d:e:f:1::", HttpUrl.parse("http://[a:b:c:d:e:f:1:0]/").host());
+    assertEquals("0:a:b:c:d:e:f:1", HttpUrl.parse("http://[0:a:b:c:d:e:f:1]/").host());
+    assertEquals("a:b:c:d:e:f:1:0", HttpUrl.parse("http://[a:b:c:d:e:f:1:0]/").host());
     assertEquals("ff01::101", HttpUrl.parse("http://[FF01:0:0:0:0:0:0:101]/").host());
+    assertEquals("2001:db8::1", HttpUrl.parse("http://[2001:db8::1]/").host());
+    assertEquals("2001:db8::2:1", HttpUrl.parse("http://[2001:db8:0:0:0:0:2:1]/").host());
+    assertEquals("2001:db8:0:1:1:1:1:1", HttpUrl.parse("http://[2001:db8:0:1:1:1:1:1]/").host());
+    assertEquals("2001:db8::1:0:0:1", HttpUrl.parse("http://[2001:db8:0:0:1:0:0:1]/").host());
+    assertEquals("2001:0:0:1::1", HttpUrl.parse("http://[2001:0:0:1:0:0:0:1]/").host());
     assertEquals("1::", HttpUrl.parse("http://[1:0:0:0:0:0:0:0]/").host());
     assertEquals("::1", HttpUrl.parse("http://[0:0:0:0:0:0:0:1]/").host());
     assertEquals("::", HttpUrl.parse("http://[0:0:0:0:0:0:0:0]/").host());
@@ -495,6 +556,15 @@ public final class HttpUrlTest {
         .override(Encoding.SKIP, '#', '+')
         .skipForUri('%', '\\', '^', '`', '{', '|', '}')
         .test(Component.QUERY);
+  }
+
+  @Test public void queryValueCharacters() throws Exception {
+    new UrlComponentEncodingTester()
+        .override(Encoding.IDENTITY, '?', '`')
+        .override(Encoding.PERCENT, '\'')
+        .override(Encoding.SKIP, '#', '+')
+        .skipForUri('%', '\\', '^', '`', '{', '|', '}')
+        .test(Component.QUERY_VALUE);
   }
 
   @Test public void fragmentCharacters() throws Exception {
@@ -1112,8 +1182,11 @@ public final class HttpUrlTest {
         .host("host")
         .addQueryParameter("=[]:;\"~|?#@^/$%*", "a")
         .build();
-    assertEquals("http://host/?%3D[]:;%22~|?%23@^/$%25*=a", url.toString());
-    assertEquals("http://host/?%3D[]:;%22~%7C?%23@%5E/$%25*=a", url.uri().toString());
+    assertEquals("http://host/?%3D%5B%5D%3A%3B%22%7E%7C%3F%23%40%5E%2F%24%25*=a",
+        url.toString());
+    assertEquals("http://host/?%3D%5B%5D%3A%3B%22%7E%7C%3F%23%40%5E%2F%24%25*=a",
+        url.uri().toString());
+    assertEquals("a", url.queryParameter("=[]:;\"~|?#@^/$%*"));
   }
 
   @Test public void toUriQueryParameterValueSpecialCharacters() throws Exception {
@@ -1122,8 +1195,11 @@ public final class HttpUrlTest {
         .host("host")
         .addQueryParameter("a", "=[]:;\"~|?#@^/$%*")
         .build();
-    assertEquals("http://host/?a=%3D[]:;%22~|?%23@^/$%25*", url.toString());
-    assertEquals("http://host/?a=%3D[]:;%22~%7C?%23@%5E/$%25*", url.uri().toString());
+    assertEquals("http://host/?a=%3D%5B%5D%3A%3B%22%7E%7C%3F%23%40%5E%2F%24%25*",
+        url.toString());
+    assertEquals("http://host/?a=%3D%5B%5D%3A%3B%22%7E%7C%3F%23%40%5E%2F%24%25*",
+        url.uri().toString());
+    assertEquals("=[]:;\"~|?#@^/$%*", url.queryParameter("a"));
   }
 
   @Test public void toUriQueryValueSpecialCharacters() throws Exception {
@@ -1134,6 +1210,42 @@ public final class HttpUrlTest {
         .build();
     assertEquals("http://host/?=[]:;%22~|?%23@^/$%25*", url.toString());
     assertEquals("http://host/?=[]:;%22~%7C?%23@%5E/$%25*", url.uri().toString());
+  }
+
+  @Test public void queryCharactersEncodedWhenComposed() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .addQueryParameter("a", "!$(),/:;?@[]\\^`{|}~")
+        .build();
+    assertEquals("http://host/?a=%21%24%28%29%2C%2F%3A%3B%3F%40%5B%5D%5C%5E%60%7B%7C%7D%7E",
+        url.toString());
+    assertEquals("!$(),/:;?@[]\\^`{|}~", url.queryParameter("a"));
+  }
+
+  /**
+   * When callers use {@code addEncodedQueryParameter()} we only encode what's strictly required.
+   * We retain the encoded (or non-encoded) state of the input.
+   */
+  @Test public void queryCharactersNotReencodedWhenComposedWithAddEncoded() throws Exception {
+    HttpUrl url = new HttpUrl.Builder()
+        .scheme("http")
+        .host("host")
+        .addEncodedQueryParameter("a", "!$(),/:;?@[]\\^`{|}~")
+        .build();
+    assertEquals("http://host/?a=!$(),/:;?@[]\\^`{|}~",
+        url.toString());
+    assertEquals("!$(),/:;?@[]\\^`{|}~", url.queryParameter("a"));
+  }
+
+  /**
+   * When callers parse a URL with query components that aren't encoded, we shouldn't convert them
+   * into a canonical form because doing so could be semantically different.
+   */
+  @Test public void queryCharactersNotReencodedWhenParsed() throws Exception {
+    HttpUrl url = HttpUrl.parse("http://host/?a=!$(),/:;?@[]\\^`{|}~");
+    assertEquals("http://host/?a=!$(),/:;?@[]\\^`{|}~", url.toString());
+    assertEquals("!$(),/:;?@[]\\^`{|}~", url.queryParameter("a"));
   }
 
   @Test public void toUriFragmentSpecialCharacters() throws Exception {
@@ -1384,6 +1496,13 @@ public final class HttpUrlTest {
     assertEquals(" ", url.queryParameter(" "));
   }
 
+  @Test public void parsedQueryDoesntIncludeFragment() {
+    HttpUrl url = HttpUrl.parse("http://host/?#fragment");
+    assertEquals("fragment", url.fragment());
+    assertEquals("", url.query());
+    assertEquals("", url.encodedQuery());
+  }
+
   @Test public void roundTripBuilder() throws Exception {
     HttpUrl url = new HttpUrl.Builder()
         .scheme("http")
@@ -1435,5 +1554,20 @@ public final class HttpUrlTest {
     assertEquals("http://host/", url.toString());
     assertEquals(null, url.fragment());
     assertEquals(null, url.encodedFragment());
+  }
+
+  @Test public void topPrivateDomain() {
+    assertEquals("google.com", HttpUrl.parse("https://google.com").topPrivateDomain());
+    assertEquals("google.co.uk", HttpUrl.parse("https://adwords.google.co.uk").topPrivateDomain());
+    assertEquals("xn--ewv.xn--4pvxs.jp", HttpUrl.parse("https://栃.栃木.jp").topPrivateDomain());
+    assertEquals("xn--ewv.xn--4pvxs.jp",
+        HttpUrl.parse("https://xn--ewv.xn--4pvxs.jp").topPrivateDomain());
+
+    assertNull(HttpUrl.parse("https://co.uk").topPrivateDomain());
+    assertNull(HttpUrl.parse("https://square").topPrivateDomain());
+    assertNull(HttpUrl.parse("https://栃木.jp").topPrivateDomain());
+    assertNull(HttpUrl.parse("https://xn--4pvxs.jp").topPrivateDomain());
+    assertNull(HttpUrl.parse("https://localhost").topPrivateDomain());
+    assertNull(HttpUrl.parse("https://127.0.0.1").topPrivateDomain());
   }
 }

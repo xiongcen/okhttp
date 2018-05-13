@@ -15,8 +15,7 @@
  */
 package okhttp3.internal.ws;
 
-import java.io.IOException;
-import java.net.ProtocolException;
+import okio.Buffer;
 import okio.ByteString;
 
 public final class WebSocketProtocol {
@@ -74,6 +73,8 @@ public final class WebSocketProtocol {
    * special values {@link #PAYLOAD_SHORT} or {@link #PAYLOAD_LONG}.
    */
   static final long PAYLOAD_BYTE_MAX = 125L;
+  /** Maximum length of close message in bytes. */
+  static final long CLOSE_MESSAGE_MAX = PAYLOAD_BYTE_MAX - 2;
   /**
    * Value for {@link #B1_MASK_LENGTH} which indicates the next two bytes are the unsigned length.
    */
@@ -88,34 +89,34 @@ public final class WebSocketProtocol {
 
   /** Used when an unchecked exception was thrown in a listener. */
   static final int CLOSE_CLIENT_GOING_AWAY = 1001;
-  /** Used when a {@link ProtocolException} was thrown by the reader or writer. */
-  static final int CLOSE_PROTOCOL_EXCEPTION = 1002;
   /** Used when an empty close frame was received (i.e., without a status code). */
   static final int CLOSE_NO_STATUS_CODE = 1005;
-  /** Used when a non-{@link ProtocolException} {@link IOException} was thrown by the reader. */
-  static final int CLOSE_ABNORMAL_TERMINATION = 1006;
 
-  static void toggleMask(byte[] buffer, long byteCount, byte[] key, long frameBytesRead) {
+  static void toggleMask(Buffer.UnsafeCursor cursor, byte[] key) {
+    int keyIndex = 0;
     int keyLength = key.length;
-    for (int i = 0; i < byteCount; i++, frameBytesRead++) {
-      int keyIndex = (int) (frameBytesRead % keyLength);
-      buffer[i] = (byte) (buffer[i] ^ key[keyIndex]);
+    do {
+      byte[] buffer = cursor.data;
+      for (int i = cursor.start, end = cursor.end; i < end; i++, keyIndex++) {
+        keyIndex %= keyLength; // Reassign to prevent overflow breaking counter.
+        buffer[i] = (byte) (buffer[i] ^ key[keyIndex]);
+      }
+    } while (cursor.next() != -1);
+  }
+
+  static String closeCodeExceptionMessage(int code) {
+    if (code < 1000 || code >= 5000) {
+      return "Code must be in range [1000,5000): " + code;
+    } else if ((code >= 1004 && code <= 1006) || (code >= 1012 && code <= 2999)) {
+      return "Code " + code + " is reserved and may not be used.";
+    } else {
+      return null;
     }
   }
 
-  static void validateCloseCode(int code, boolean argument) throws ProtocolException {
-    String message = null;
-    if (code < 1000 || code >= 5000) {
-      message = "Code must be in range [1000,5000): " + code;
-    } else if ((code >= 1004 && code <= 1006) || (code >= 1012 && code <= 2999)) {
-      message = "Code " + code + " is reserved and may not be used.";
-    }
-    if (message != null) {
-      if (argument) {
-        throw new IllegalArgumentException(message);
-      }
-      throw new ProtocolException(message);
-    }
+  static void validateCloseCode(int code) {
+    String message = closeCodeExceptionMessage(code);
+    if (message != null) throw new IllegalArgumentException(message);
   }
 
   public static String acceptHeader(String key) {

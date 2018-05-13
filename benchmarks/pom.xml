@@ -6,7 +6,7 @@
   <parent>
     <groupId>com.squareup.okhttp3</groupId>
     <artifactId>parent</artifactId>
-    <version>3.5.0-SNAPSHOT</version>
+    <version>3.11.0-SNAPSHOT</version>
   </parent>
 
   <artifactId>benchmarks</artifactId>
@@ -74,6 +74,7 @@
       <plugin>
         <groupId>org.codehaus.mojo</groupId>
         <artifactId>exec-maven-plugin</artifactId>
+        <version>1.5.0</version>
         <executions>
           <execution>
             <goals>
@@ -129,6 +130,7 @@
             <!-- Fails on caliper's ASM on OpenJDK 8. -->
             <groupId>org.codehaus.mojo</groupId>
             <artifactId>animal-sniffer-maven-plugin</artifactId>
+            <version>1.15</version>
             <executions>
               <execution>
                 <phase>none</phase>

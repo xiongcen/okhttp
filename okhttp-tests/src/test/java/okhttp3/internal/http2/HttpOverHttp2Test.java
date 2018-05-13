@@ -21,12 +21,19 @@ import java.net.Authenticator;
 import java.net.HttpURLConnection;
 import java.net.SocketTimeoutException;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import javax.net.ssl.HostnameVerifier;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import okhttp3.Cache;
 import okhttp3.Call;
+import okhttp3.Callback;
 import okhttp3.Cookie;
 import okhttp3.Credentials;
 import okhttp3.Headers;
@@ -39,16 +46,22 @@ import okhttp3.RecordingHostnameVerifier;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
+import okhttp3.Route;
+import okhttp3.TestLogHandler;
+import okhttp3.TestUtil;
 import okhttp3.internal.DoubleInetAddressDns;
 import okhttp3.internal.RecordingOkAuthenticator;
 import okhttp3.internal.SingleInetAddressDns;
 import okhttp3.internal.Util;
-import okhttp3.internal.tls.SslClient;
+import okhttp3.internal.connection.RealConnection;
+import okhttp3.mockwebserver.Dispatcher;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import okhttp3.mockwebserver.PushPromise;
+import okhttp3.mockwebserver.QueueDispatcher;
 import okhttp3.mockwebserver.RecordedRequest;
 import okhttp3.mockwebserver.SocketPolicy;
+import okhttp3.mockwebserver.internal.tls.SslClient;
 import okio.Buffer;
 import okio.BufferedSink;
 import okio.GzipSink;
@@ -59,38 +72,84 @@ import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static okhttp3.TestUtil.defaultClient;
+import static org.hamcrest.CoreMatchers.containsString;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertThat;
 import static org.junit.Assert.fail;
+import static org.junit.Assume.assumeTrue;
 
 /** Test how SPDY interacts with HTTP/2 features. */
+@RunWith(Parameterized.class)
 public final class HttpOverHttp2Test {
+  private static final Logger http2Logger = Logger.getLogger(Http2.class.getName());
+  private static final SslClient sslClient = SslClient.localhost();
+
+  @Parameters(name = "{0}")
+  public static Collection<Protocol> data() {
+    return Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE, Protocol.HTTP_2);
+  }
+
   @Rule public final TemporaryFolder tempDir = new TemporaryFolder();
   @Rule public final MockWebServer server = new MockWebServer();
 
-  private SslClient sslClient = SslClient.localhost();
-  private HostnameVerifier hostnameVerifier = new RecordingHostnameVerifier();
   private OkHttpClient client;
   private Cache cache;
+  private TestLogHandler http2Handler = new TestLogHandler();
+  private Level previousLevel;
+  private String scheme;
+  private Protocol protocol;
 
-  @Before public void setUp() throws Exception {
-    server.useHttps(sslClient.socketFactory, false);
-    cache = new Cache(tempDir.getRoot(), Integer.MAX_VALUE);
-    client = defaultClient().newBuilder()
+  public HttpOverHttp2Test(Protocol protocol) {
+    this.client = protocol == Protocol.HTTP_2 ? buildHttp2Client() : buildH2PriorKnowledgeClient();
+    this.scheme = protocol == Protocol.HTTP_2 ? "https" : "http";
+    this.protocol = protocol;
+  }
+
+  private static OkHttpClient buildH2PriorKnowledgeClient() {
+    return defaultClient().newBuilder()
+        .protocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE))
+        .build();
+  }
+
+  private static OkHttpClient buildHttp2Client() {
+    return defaultClient().newBuilder()
         .protocols(Arrays.asList(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .dns(new SingleInetAddressDns())
         .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
-        .hostnameVerifier(hostnameVerifier)
+        .hostnameVerifier(new RecordingHostnameVerifier())
         .build();
+  }
+
+  @Before public void setUp() throws Exception {
+    if (protocol == Protocol.H2_PRIOR_KNOWLEDGE) {
+      server.setProtocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE));
+    } else {
+      server.useHttps(sslClient.socketFactory, false);
+    }
+
+    cache = new Cache(tempDir.getRoot(), Integer.MAX_VALUE);
+
+    http2Logger.addHandler(http2Handler);
+    previousLevel = http2Logger.getLevel();
+    http2Logger.setLevel(Level.FINE);
   }
 
   @After public void tearDown() throws Exception {
     Authenticator.setDefault(null);
+    http2Logger.removeHandler(http2Handler);
+    http2Logger.setLevel(previousLevel);
+
+    client.connectionPool().evictAll();
   }
 
   @Test public void get() throws Exception {
@@ -105,11 +164,12 @@ public final class HttpOverHttp2Test {
 
     assertEquals("ABCDE", response.body().string());
     assertEquals(200, response.code());
-    assertEquals("Sweet", response.message());
+    assertEquals("", response.message());
+    assertEquals(protocol, response.protocol());
 
     RecordedRequest request = server.takeRequest();
     assertEquals("GET /foo HTTP/1.1", request.getRequestLine());
-    assertEquals("https", request.getHeader(":scheme"));
+    assertEquals(scheme, request.getHeader(":scheme"));
     assertEquals(server.getHostName() + ":" + server.getPort(), request.getHeader(":authority"));
   }
 
@@ -201,8 +261,8 @@ public final class HttpOverHttp2Test {
 
           @Override public void writeTo(BufferedSink sink) throws IOException {
             sink.write(postBytes);  // push bytes into the stream's buffer
-            sink.flush(); // FramedConnection.writeData subject to write window
-            sink.close(); // FramedConnection.writeData empty frame
+            sink.flush(); // Http2Connection.writeData subject to write window
+            sink.close(); // Http2Connection.writeData empty frame
           }
         })
         .build());
@@ -238,6 +298,40 @@ public final class HttpOverHttp2Test {
 
     response1.close();
     response2.close();
+  }
+
+  @Test public void connectionWindowUpdateAfterCanceling() throws Exception {
+    server.enqueue(new MockResponse()
+        .setBody(new Buffer().write(new byte[Http2Connection.OKHTTP_CLIENT_WINDOW_SIZE + 1])));
+    server.enqueue(new MockResponse()
+        .setBody("abc"));
+
+    Call call1 = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    Response response1 = call1.execute();
+
+    // Wait until the server has completely filled the stream and connection flow-control windows.
+    int expectedFrameCount = Http2Connection.OKHTTP_CLIENT_WINDOW_SIZE / 16384;
+    int dataFrameCount = 0;
+    while (dataFrameCount < expectedFrameCount) {
+      String log = http2Handler.take();
+      if (log.equals("FINE: << 0x00000003 16384 DATA          ")) {
+        dataFrameCount++;
+      }
+    }
+
+    // Cancel the call and discard what we've buffered for the response body. This should free up
+    // the connection flow-control window so new requests can proceed.
+    call1.cancel();
+    assertFalse("Call should not have completed successfully.",
+        Util.discard(response1.body().source(), 1, TimeUnit.SECONDS));
+
+    Call call2 = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    Response response2 = call2.execute();
+    assertEquals("abc", response2.body().string());
   }
 
   /** https://github.com/square/okhttp/issues/373 */
@@ -330,8 +424,7 @@ public final class HttpOverHttp2Test {
     in.close();
   }
 
-  @Ignore // See https://github.com/square/okhttp/issues/578
-  @Test(timeout = 3000) public void readResponseHeaderTimeout() throws Exception {
+  @Test public void readResponseHeaderTimeout() throws Exception {
     server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE));
     server.enqueue(new MockResponse().setBody("A"));
 
@@ -339,11 +432,27 @@ public final class HttpOverHttp2Test {
         .readTimeout(1000, MILLISECONDS)
         .build();
 
-    Call call = client.newCall(new Request.Builder()
+    // Make a call expecting a timeout reading the response headers.
+    Call call1 = client.newCall(new Request.Builder()
         .url(server.url("/"))
         .build());
-    Response response = call.execute();
-    assertEquals("A", response.body().string());
+    try {
+      call1.execute();
+      fail("Should have timed out!");
+    } catch (SocketTimeoutException expected) {
+      assertEquals("timeout", expected.getMessage());
+    }
+
+    // Confirm that a subsequent request on the same connection is not impacted.
+    Call call2 = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    Response response2 = call2.execute();
+    assertEquals("A", response2.body().string());
+
+    // Confirm that the connection was reused.
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(1, server.takeRequest().getSequenceNumber());
   }
 
   /**
@@ -376,27 +485,39 @@ public final class HttpOverHttp2Test {
    * time.
    */
   @Test public void readTimeoutOnSlowConnection() throws Exception {
-    char[] body = new char[2048]; // 2KiB to read.
-    Arrays.fill(body, 'y');
+    String body = TestUtil.repeat('y', 2048);
     server.enqueue(new MockResponse()
-        .setBody(new String(body))
+        .setBody(body)
         .throttleBody(1024, 1, SECONDS)); // Slow connection 1KiB/second.
+    server.enqueue(new MockResponse()
+        .setBody(body));
 
     client = client.newBuilder()
         .readTimeout(500, MILLISECONDS) // Half a second to read something.
         .build();
 
-    Call call = client.newCall(new Request.Builder()
+    // Make a call expecting a timeout reading the response body.
+    Call call1 = client.newCall(new Request.Builder()
         .url(server.url("/"))
         .build());
-    Response response = call.execute();
-
+    Response response1 = call1.execute();
     try {
-      response.body().string();
+      response1.body().string();
       fail("Should have timed out!");
     } catch (SocketTimeoutException expected) {
       assertEquals("timeout", expected.getMessage());
     }
+
+    // Confirm that a subsequent request on the same connection is not impacted.
+    Call call2 = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    Response response2 = call2.execute();
+    assertEquals(body, response2.body().string());
+
+    // Confirm that the connection was reused.
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(1, server.takeRequest().getSequenceNumber());
   }
 
   @Test public void connectionTimeout() throws Exception {
@@ -428,6 +549,10 @@ public final class HttpOverHttp2Test {
       fail();
     } catch (IOException expected) {
     }
+
+    // Confirm that the connection was reused.
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+    assertEquals(1, server.takeRequest().getSequenceNumber());
   }
 
   @Test public void responsesAreCached() throws IOException {
@@ -691,6 +816,74 @@ public final class HttpOverHttp2Test {
     }
   }
 
+  @Test public void recoverFromConnectionNoNewStreamsOnFollowUp() throws InterruptedException {
+    server.enqueue(new MockResponse()
+        .setResponseCode(401));
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.RESET_STREAM_AT_START)
+        .setHttp2ErrorCode(ErrorCode.CANCEL.httpCode));
+    server.enqueue(new MockResponse()
+        .setBody("DEF"));
+    server.enqueue(new MockResponse()
+        .setResponseCode(301)
+        .addHeader("Location", "/foo"));
+    server.enqueue(new MockResponse()
+        .setBody("ABC"));
+
+    final CountDownLatch latch = new CountDownLatch(1);
+    final BlockingQueue<String> responses = new SynchronousQueue<>();
+    okhttp3.Authenticator authenticator = new okhttp3.Authenticator() {
+      @Override public Request authenticate(Route route, Response response) throws IOException {
+        responses.offer(response.body().string());
+        try {
+          latch.await();
+        } catch (InterruptedException e) {
+          throw new AssertionError();
+        }
+        return response.request();
+      }
+    };
+
+    OkHttpClient blockingAuthClient = client.newBuilder()
+        .authenticator(authenticator)
+        .build();
+
+    Callback callback = new Callback() {
+      @Override public void onFailure(Call call, IOException e) {
+        fail();
+      }
+
+      @Override public void onResponse(Call call, Response response) throws IOException {
+        responses.offer(response.body().string());
+      }
+    };
+
+    // Make the first request waiting until we get our auth challenge.
+    Request request = new Request.Builder()
+        .url(server.url("/"))
+        .build();
+    blockingAuthClient.newCall(request).enqueue(callback);
+    String response1 = responses.take();
+    assertEquals("", response1);
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+
+    // Now make the second request which will restrict the first HTTP/2 connection from creating new
+    // streams.
+    client.newCall(request).enqueue(callback);
+    String response2 = responses.take();
+    assertEquals("DEF", response2);
+    assertEquals(1, server.takeRequest().getSequenceNumber());
+    assertEquals(0, server.takeRequest().getSequenceNumber());
+
+    // Let the first request proceed. It should discard the the held HTTP/2 connection and get a new
+    // one.
+    latch.countDown();
+    String response3 = responses.take();
+    assertEquals("ABC", response3);
+    assertEquals(1, server.takeRequest().getSequenceNumber());
+    assertEquals(2, server.takeRequest().getSequenceNumber());
+  }
+
   @Test public void nonAsciiResponseHeader() throws Exception {
     server.enqueue(new MockResponse()
         .addHeaderLenient("Alpha", "α")
@@ -721,11 +914,11 @@ public final class HttpOverHttp2Test {
 
     assertEquals("ABCDE", response.body().string());
     assertEquals(200, response.code());
-    assertEquals("Sweet", response.message());
+    assertEquals("", response.message());
 
     RecordedRequest request = server.takeRequest();
     assertEquals("GET /foo HTTP/1.1", request.getRequestLine());
-    assertEquals("https", request.getHeader(":scheme"));
+    assertEquals(scheme, request.getHeader(":scheme"));
     assertEquals(server.getHostName() + ":" + server.getPort(), request.getHeader(":authority"));
 
     RecordedRequest pushedRequest = server.takeRequest();
@@ -747,16 +940,131 @@ public final class HttpOverHttp2Test {
     Response response = call.execute();
     assertEquals("ABCDE", response.body().string());
     assertEquals(200, response.code());
-    assertEquals("Sweet", response.message());
+    assertEquals("", response.message());
 
     RecordedRequest request = server.takeRequest();
     assertEquals("GET /foo HTTP/1.1", request.getRequestLine());
-    assertEquals("https", request.getHeader(":scheme"));
+    assertEquals(scheme, request.getHeader(":scheme"));
     assertEquals(server.getHostName() + ":" + server.getPort(), request.getHeader(":authority"));
 
     RecordedRequest pushedRequest = server.takeRequest();
     assertEquals("HEAD /foo/bar HTTP/1.1", pushedRequest.getRequestLine());
     assertEquals("bar", pushedRequest.getHeader("foo"));
+  }
+
+  @Test public void noDataFramesSentWithNullRequestBody() throws Exception {
+    server.enqueue(new MockResponse()
+        .setBody("ABC"));
+
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .method("DELETE", null)
+        .build());
+    Response response = call.execute();
+    assertEquals("ABC", response.body().string());
+
+    assertEquals(protocol, response.protocol());
+
+    List<String> logs = http2Handler.takeAll();
+
+    assertThat("header logged", firstFrame(logs, "HEADERS"), containsString("HEADERS       END_STREAM|END_HEADERS"));
+  }
+
+  @Test public void emptyDataFrameSentWithEmptyBody() throws Exception {
+    server.enqueue(new MockResponse()
+        .setBody("ABC"));
+
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .method("DELETE", Util.EMPTY_REQUEST)
+        .build());
+    Response response = call.execute();
+    assertEquals("ABC", response.body().string());
+
+    assertEquals(protocol, response.protocol());
+
+    List<String> logs = http2Handler.takeAll();
+
+    assertThat("header logged", firstFrame(logs, "HEADERS"), containsString("HEADERS       END_HEADERS"));
+    assertThat("data logged", firstFrame(logs, "DATA"), containsString("0 DATA          END_STREAM"));
+  }
+
+  @Test public void pingsTransmitted() throws Exception {
+    // Ping every 500 ms, starting at 500 ms.
+    client = client.newBuilder()
+        .pingInterval(500, TimeUnit.MILLISECONDS)
+        .build();
+
+    // Delay the response to give 1 ping enough time to be sent and replied to.
+    server.enqueue(new MockResponse()
+        .setBodyDelay(750, TimeUnit.MILLISECONDS)
+        .setBody("ABC"));
+
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    Response response = call.execute();
+    assertEquals("ABC", response.body().string());
+
+    assertEquals(protocol, response.protocol());
+
+    // Confirm a single ping was sent and received, and its reply was sent and received.
+    List<String> logs = http2Handler.takeAll();
+    assertEquals(1, countFrames(logs, "FINE: >> 0x00000000     8 PING          "));
+    assertEquals(1, countFrames(logs, "FINE: << 0x00000000     8 PING          "));
+    assertEquals(1, countFrames(logs, "FINE: >> 0x00000000     8 PING          ACK"));
+    assertEquals(1, countFrames(logs, "FINE: << 0x00000000     8 PING          ACK"));
+  }
+
+  @Test public void missingPongsFailsConnection() throws Exception {
+    // Ping every 500 ms, starting at 500 ms.
+    client = client.newBuilder()
+        .readTimeout(10, TimeUnit.SECONDS) // Confirm we fail before the read timeout.
+        .pingInterval(500, TimeUnit.MILLISECONDS)
+        .build();
+
+    // Set up the server to ignore the socket. It won't respond to pings!
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.STALL_SOCKET_AT_START));
+
+    // Make a call. It'll fail as soon as our pings detect a problem.
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    long executeAtNanos = System.nanoTime();
+    try {
+      call.execute();
+      fail();
+    } catch (StreamResetException expected) {
+      assertEquals("stream was reset: PROTOCOL_ERROR", expected.getMessage());
+    }
+
+    long elapsedUntilFailure = System.nanoTime() - executeAtNanos;
+    assertEquals(1000, TimeUnit.NANOSECONDS.toMillis(elapsedUntilFailure), 250d);
+
+    // Confirm a single ping was sent but not acknowledged.
+    List<String> logs = http2Handler.takeAll();
+    assertEquals(1, countFrames(logs, "FINE: >> 0x00000000     8 PING          "));
+    assertEquals(0, countFrames(logs, "FINE: << 0x00000000     8 PING          ACK"));
+  }
+
+  private String firstFrame(List<String> logs, String type) {
+    for (String log: logs) {
+      if (log.contains(type)) {
+        return log;
+      }
+    }
+    return null;
+  }
+
+  private int countFrames(List<String> logs, String message) {
+    int result = 0;
+    for (String log: logs) {
+      if (log.equals(message)) {
+        result++;
+      }
+    }
+    return result;
   }
 
   /**
@@ -854,6 +1162,9 @@ public final class HttpOverHttp2Test {
                   .build());
               Response response = call.execute();
               assertEquals("ABC", response.body().string());
+              // Wait until the GOAWAY has been processed.
+              RealConnection connection = (RealConnection) chain.connection();
+              while (connection.isHealthy(false)) ;
             }
             return chain.proceed(chain.request());
           }
@@ -870,7 +1181,149 @@ public final class HttpOverHttp2Test {
     assertEquals(0, server.takeRequest().getSequenceNumber());
   }
 
-  public Buffer gzip(String bytes) throws IOException {
+  @Test public void responseHeadersAfterGoaway() throws Exception {
+    server.enqueue(new MockResponse()
+        .setHeadersDelay(1, SECONDS)
+        .setBody("ABC"));
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.DISCONNECT_AT_END)
+        .setBody("DEF"));
+
+    final BlockingQueue<String> bodies = new SynchronousQueue<>();
+    Callback callback = new Callback() {
+      @Override public void onResponse(Call call, Response response) throws IOException {
+        bodies.add(response.body().string());
+      }
+      @Override public void onFailure(Call call, IOException e) {
+        System.out.println(e);
+      }
+    };
+    client.newCall(new Request.Builder().url(server.url("/")).build()).enqueue(callback);
+    client.newCall(new Request.Builder().url(server.url("/")).build()).enqueue(callback);
+
+    assertEquals("DEF", bodies.poll(2, SECONDS));
+    assertEquals("ABC", bodies.poll(2, SECONDS));
+    assertEquals(2, server.getRequestCount());
+  }
+
+  /**
+   * We don't know if the connection will support HTTP/2 until after we've connected. When multiple
+   * connections are requested concurrently OkHttp will pessimistically connect multiple times, then
+   * close any unnecessary connections. This test confirms that behavior works as intended.
+   *
+   * <p>This test uses proxy tunnels to get a hook while a connection is being established.
+   */
+  @Test public void concurrentHttp2ConnectionsDeduplicated() throws Exception {
+    assumeTrue(protocol == Protocol.HTTP_2);
+
+    server.useHttps(sslClient.socketFactory, true);
+
+    // Force a fresh connection pool for the test.
+    client.connectionPool().evictAll();
+
+    final QueueDispatcher queueDispatcher = new QueueDispatcher();
+    queueDispatcher.enqueueResponse(new MockResponse()
+        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
+        .clearHeaders());
+    queueDispatcher.enqueueResponse(new MockResponse()
+        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
+        .clearHeaders());
+    queueDispatcher.enqueueResponse(new MockResponse()
+        .setBody("call2 response"));
+    queueDispatcher.enqueueResponse(new MockResponse()
+        .setBody("call1 response"));
+
+    // We use a re-entrant dispatcher to initiate one HTTPS connection while the other is in flight.
+    server.setDispatcher(new Dispatcher() {
+      int requestCount;
+
+      @Override public MockResponse dispatch(RecordedRequest request) throws InterruptedException {
+        MockResponse result = queueDispatcher.dispatch(request);
+
+        requestCount++;
+        if (requestCount == 1) {
+          // Before handling call1's CONNECT we do all of call2. This part re-entrant!
+          try {
+            Call call2 = client.newCall(new Request.Builder()
+                .url("https://android.com/call2")
+                .build());
+            Response response2 = call2.execute();
+            assertEquals("call2 response", response2.body().string());
+          } catch (IOException e) {
+            throw new RuntimeException(e);
+          }
+        }
+
+        return result;
+      }
+
+      @Override public MockResponse peek() {
+        return queueDispatcher.peek();
+      }
+
+      @Override public void shutdown() {
+        queueDispatcher.shutdown();
+      }
+    });
+
+    client = client.newBuilder()
+        .proxy(server.toProxyAddress())
+        .build();
+
+    Call call1 = client.newCall(new Request.Builder()
+        .url("https://android.com/call1")
+        .build());
+    Response response2 = call1.execute();
+    assertEquals("call1 response", response2.body().string());
+
+    RecordedRequest call1Connect = server.takeRequest();
+    assertEquals("CONNECT", call1Connect.getMethod());
+    assertEquals(0, call1Connect.getSequenceNumber());
+
+    RecordedRequest call2Connect = server.takeRequest();
+    assertEquals("CONNECT", call2Connect.getMethod());
+    assertEquals(0, call2Connect.getSequenceNumber());
+
+    RecordedRequest call2Get = server.takeRequest();
+    assertEquals("GET", call2Get.getMethod());
+    assertEquals("/call2", call2Get.getPath());
+    assertEquals(0, call2Get.getSequenceNumber());
+
+    RecordedRequest call1Get = server.takeRequest();
+    assertEquals("GET", call1Get.getMethod());
+    assertEquals("/call1", call1Get.getPath());
+    assertEquals(1, call1Get.getSequenceNumber());
+
+    assertEquals(1, client.connectionPool().connectionCount());
+  }
+
+  /** https://github.com/square/okhttp/issues/3103 */
+  @Test public void domainFronting() throws Exception {
+    client = client.newBuilder()
+        .addNetworkInterceptor(new Interceptor() {
+          @Override public Response intercept(Chain chain) throws IOException {
+            Request request = chain.request().newBuilder()
+                .header("Host", "privateobject.com")
+                .build();
+            return chain.proceed(request);
+          }
+        })
+        .build();
+
+    server.enqueue(new MockResponse());
+
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+
+    Response response = call.execute();
+    assertEquals("", response.body().string());
+
+    RecordedRequest recordedRequest = server.takeRequest();
+    assertEquals("privateobject.com", recordedRequest.getHeader(":authority"));
+  }
+
+  private Buffer gzip(String bytes) throws IOException {
     Buffer bytesOut = new Buffer();
     BufferedSink sink = Okio.buffer(new GzipSink(bytesOut));
     sink.writeUtf8(bytes);
@@ -882,7 +1335,7 @@ public final class HttpOverHttp2Test {
     String path;
     CountDownLatch countDownLatch;
 
-    public AsyncRequest(String path, CountDownLatch countDownLatch) {
+    AsyncRequest(String path, CountDownLatch countDownLatch) {
       this.path = path;
       this.countDownLatch = countDownLatch;
     }

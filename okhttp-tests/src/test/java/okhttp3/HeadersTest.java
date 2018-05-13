@@ -22,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import okhttp3.internal.Internal;
+import okhttp3.internal.Util;
 import okhttp3.internal.http.HttpHeaders;
 import okhttp3.internal.http2.Header;
 import okhttp3.internal.http2.Http2Codec;
@@ -44,7 +45,7 @@ public final class HeadersTest {
         ":version", "HTTP/1.1",
         "connection", "close");
     Request request = new Request.Builder().url("http://square.com/").build();
-    Response response = Http2Codec.readHttp2HeadersList(headerBlock).request(request).build();
+    Response response = Http2Codec.readHttp2HeadersList(headerBlock, Protocol.HTTP_2).request(request).build();
     Headers headers = response.headers();
     assertEquals(1, headers.size());
     assertEquals(":version", headers.name(0));
@@ -56,6 +57,7 @@ public final class HeadersTest {
         .url("http://square.com/")
         .header("Connection", "upgrade")
         .header("Upgrade", "websocket")
+        .header("Host", "square.com")
         .build();
     List<Header> expected = headerEntries(
         ":method", "GET",
@@ -154,7 +156,7 @@ public final class HeadersTest {
     assertEquals("OkHttp", headers.value(0));
   }
 
-  @Test public void ofRejectsNulChar() {
+  @Test public void ofRejectsNullChar() {
     try {
       Headers.of("User-Agent", "Square\u0000OkHttp");
       fail();
@@ -210,17 +212,17 @@ public final class HeadersTest {
     assertEquals("OkHttp", headers.value(0));
   }
 
-  @Test public void ofMapRejectsNulCharInName() {
+  @Test public void ofMapRejectsNullCharInName() {
     try {
-      Headers.of(Collections.singletonMap("User-Agent", "Square\u0000OkHttp"));
+      Headers.of(Collections.singletonMap("User-\u0000Agent", "OkHttp"));
       fail();
     } catch (IllegalArgumentException expected) {
     }
   }
 
-  @Test public void ofMapRejectsNulCharInValue() {
+  @Test public void ofMapRejectsNullCharInValue() {
     try {
-      Headers.of(Collections.singletonMap("User-\u0000Agent", "OkHttp"));
+      Headers.of(Collections.singletonMap("User-Agent", "Square\u0000OkHttp"));
       fail();
     } catch (IllegalArgumentException expected) {
     }
@@ -248,8 +250,8 @@ public final class HeadersTest {
 
   @Test public void toMultimapAllowsCaseInsensitiveGet() {
     Headers headers = Headers.of(
-            "cache-control", "no-store",
-            "Cache-Control", "no-cache");
+        "cache-control", "no-store",
+        "Cache-Control", "no-cache");
     Map<String, List<String>> headerMap = headers.toMultimap();
     assertEquals(2, headerMap.get("cache-control").size());
     assertEquals(2, headerMap.get("Cache-Control").size());
@@ -432,5 +434,41 @@ public final class HeadersTest {
         .add("WWW-Authenticate", "Digest").build();
     challenges = HttpHeaders.parseChallenges(headers, "WWW-Authenticate");
     assertEquals(0, challenges.size());
+  }
+
+  @Test public void basicChallenge() {
+    Headers headers = new Headers.Builder()
+        .add("WWW-Authenticate: Basic realm=\"protected area\"")
+        .build();
+    assertEquals(Arrays.asList(new Challenge("Basic", "protected area")),
+        HttpHeaders.parseChallenges(headers, "WWW-Authenticate"));
+  }
+
+  @Test public void basicChallengeWithCharset() {
+    Headers headers = new Headers.Builder()
+        .add("WWW-Authenticate: Basic realm=\"protected area\", charset=\"UTF-8\"")
+        .build();
+    assertEquals(Arrays.asList(new Challenge("Basic", "protected area").withCharset(Util.UTF_8)),
+        HttpHeaders.parseChallenges(headers, "WWW-Authenticate"));
+  }
+
+  @Test public void basicChallengeWithUnexpectedCharset() {
+    Headers headers = new Headers.Builder()
+        .add("WWW-Authenticate: Basic realm=\"protected area\", charset=\"US-ASCII\"")
+        .build();
+    assertEquals(Collections.emptyList(), HttpHeaders.parseChallenges(headers, "WWW-Authenticate"));
+  }
+
+  @Test public void byteCount() {
+    assertEquals(0L, new Headers.Builder().build().byteCount());
+    assertEquals(10L, new Headers.Builder()
+        .add("abc", "def")
+        .build()
+        .byteCount());
+    assertEquals(20L, new Headers.Builder()
+        .add("abc", "def")
+        .add("ghi", "jkl")
+        .build()
+        .byteCount());
   }
 }

@@ -41,9 +41,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
@@ -69,7 +67,7 @@ import okhttp3.internal.http2.Http2Connection;
 import okhttp3.internal.http2.Http2Stream;
 import okhttp3.internal.http2.Settings;
 import okhttp3.internal.platform.Platform;
-import okhttp3.internal.ws.RealNewWebSocket;
+import okhttp3.internal.ws.RealWebSocket;
 import okhttp3.internal.ws.WebSocketProtocol;
 import okio.Buffer;
 import okio.BufferedSink;
@@ -78,28 +76,29 @@ import okio.ByteString;
 import okio.Okio;
 import okio.Sink;
 import okio.Timeout;
-import org.junit.rules.TestRule;
-import org.junit.runner.Description;
-import org.junit.runners.model.Statement;
+import org.junit.rules.ExternalResource;
 
-import static java.util.concurrent.TimeUnit.SECONDS;
+import static okhttp3.internal.Util.closeQuietly;
+import static okhttp3.mockwebserver.SocketPolicy.CONTINUE_ALWAYS;
 import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST;
 import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_END;
 import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START;
 import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_DURING_REQUEST_BODY;
 import static okhttp3.mockwebserver.SocketPolicy.DISCONNECT_DURING_RESPONSE_BODY;
+import static okhttp3.mockwebserver.SocketPolicy.EXPECT_CONTINUE;
 import static okhttp3.mockwebserver.SocketPolicy.FAIL_HANDSHAKE;
 import static okhttp3.mockwebserver.SocketPolicy.NO_RESPONSE;
 import static okhttp3.mockwebserver.SocketPolicy.RESET_STREAM_AT_START;
 import static okhttp3.mockwebserver.SocketPolicy.SHUTDOWN_INPUT_AT_END;
 import static okhttp3.mockwebserver.SocketPolicy.SHUTDOWN_OUTPUT_AT_END;
+import static okhttp3.mockwebserver.SocketPolicy.STALL_SOCKET_AT_START;
 import static okhttp3.mockwebserver.SocketPolicy.UPGRADE_TO_SSL_AT_END;
 
 /**
  * A scriptable web server. Callers supply canned responses and the server replays them upon request
  * in sequence.
  */
-public final class MockWebServer implements TestRule, Closeable {
+public final class MockWebServer extends ExternalResource implements Closeable {
   static {
     Internal.initializeInstanceForTests();
   }
@@ -143,7 +142,7 @@ public final class MockWebServer implements TestRule, Closeable {
 
   private boolean started;
 
-  private synchronized void maybeStart() {
+  @Override protected synchronized void before() {
     if (started) return;
     try {
       start();
@@ -152,36 +151,20 @@ public final class MockWebServer implements TestRule, Closeable {
     }
   }
 
-  @Override public Statement apply(final Statement base, Description description) {
-    return new Statement() {
-      @Override public void evaluate() throws Throwable {
-        maybeStart();
-        try {
-          base.evaluate();
-        } finally {
-          try {
-            shutdown();
-          } catch (IOException e) {
-            logger.log(Level.WARNING, "MockWebServer shutdown failed", e);
-          }
-        }
-      }
-    };
-  }
-
   public int getPort() {
-    maybeStart();
+    before();
     return port;
   }
 
   public String getHostName() {
-    maybeStart();
-    return inetSocketAddress.getHostName();
+    before();
+    return inetSocketAddress.getAddress().getCanonicalHostName();
   }
 
   public Proxy toProxyAddress() {
-    maybeStart();
-    InetSocketAddress address = new InetSocketAddress(inetSocketAddress.getAddress(), getPort());
+    before();
+    InetSocketAddress address = new InetSocketAddress(inetSocketAddress.getAddress()
+            .getCanonicalHostName(), getPort());
     return new Proxy(Proxy.Type.HTTP, address);
   }
 
@@ -231,13 +214,22 @@ public final class MockWebServer implements TestRule, Closeable {
    */
   public void setProtocols(List<Protocol> protocols) {
     protocols = Util.immutableList(protocols);
-    if (!protocols.contains(Protocol.HTTP_1_1)) {
+    if (protocols.contains(Protocol.H2_PRIOR_KNOWLEDGE) && protocols.size() > 1) {
+      // when using h2_prior_knowledge, no other protocol should be supported.
+      throw new IllegalArgumentException(
+          "protocols containing h2_prior_knowledge cannot use other protocols: " + protocols);
+    } else if (!protocols.contains(Protocol.H2_PRIOR_KNOWLEDGE)
+        && !protocols.contains(Protocol.HTTP_1_1)) {
       throw new IllegalArgumentException("protocols doesn't contain http/1.1: " + protocols);
     }
     if (protocols.contains(null)) {
       throw new IllegalArgumentException("protocols must not contain null");
     }
     this.protocols = protocols;
+  }
+
+  public List<Protocol> protocols() {
+    return protocols;
   }
 
   /**
@@ -347,13 +339,13 @@ public final class MockWebServer implements TestRule, Closeable {
         }
 
         // Release all sockets and all threads, even if any close fails.
-        Util.closeQuietly(serverSocket);
+        closeQuietly(serverSocket);
         for (Iterator<Socket> s = openClientSockets.iterator(); s.hasNext(); ) {
-          Util.closeQuietly(s.next());
+          closeQuietly(s.next());
           s.remove();
         }
         for (Iterator<Http2Connection> s = openConnections.iterator(); s.hasNext(); ) {
-          Util.closeQuietly(s.next());
+          closeQuietly(s.next());
           s.remove();
         }
         dispatcher.shutdown();
@@ -399,6 +391,14 @@ public final class MockWebServer implements TestRule, Closeable {
     }
   }
 
+  @Override protected synchronized void after() {
+    try {
+      shutdown();
+    } catch (IOException e) {
+      logger.log(Level.WARNING, "MockWebServer shutdown failed", e);
+    }
+  }
+
   private void serveConnection(final Socket raw) {
     executor.execute(new NamedRunnable("MockWebServer %s", raw.getRemoteSocketAddress()) {
       int sequenceNumber = 0;
@@ -416,13 +416,13 @@ public final class MockWebServer implements TestRule, Closeable {
       }
 
       public void processConnection() throws Exception {
+        SocketPolicy socketPolicy = dispatcher.peek().getSocketPolicy();
         Protocol protocol = Protocol.HTTP_1_1;
         Socket socket;
         if (sslSocketFactory != null) {
           if (tunnelProxy) {
             createTunnel();
           }
-          SocketPolicy socketPolicy = dispatcher.peek().getSocketPolicy();
           if (socketPolicy == FAIL_HANDSHAKE) {
             dispatchBookkeepingRequest(sequenceNumber, raw);
             processHandshakeFailure(raw);
@@ -445,15 +445,22 @@ public final class MockWebServer implements TestRule, Closeable {
             protocol = protocolString != null ? Protocol.get(protocolString) : Protocol.HTTP_1_1;
           }
           openClientSockets.remove(raw);
+        } else if (protocols.contains(Protocol.H2_PRIOR_KNOWLEDGE)) {
+          socket = raw;
+          protocol = Protocol.H2_PRIOR_KNOWLEDGE;
         } else {
           socket = raw;
         }
 
-        if (protocol == Protocol.HTTP_2) {
-          FramedSocketHandler framedSocketListener = new FramedSocketHandler(socket, protocol);
+        if (socketPolicy == STALL_SOCKET_AT_START) {
+          return; // Ignore the socket until the server is shut down!
+        }
+
+        if (protocol == Protocol.HTTP_2 || protocol == Protocol.H2_PRIOR_KNOWLEDGE) {
+          Http2SocketHandler http2SocketHandler = new Http2SocketHandler(socket, protocol);
           Http2Connection connection = new Http2Connection.Builder(false)
               .socket(socket)
-              .listener(framedSocketListener)
+              .listener(http2SocketHandler)
               .build();
           connection.start();
           openConnections.add(connection);
@@ -476,8 +483,6 @@ public final class MockWebServer implements TestRule, Closeable {
               + " didn't make a request");
         }
 
-        source.close();
-        sink.close();
         socket.close();
         openClientSockets.remove(socket);
       }
@@ -605,12 +610,13 @@ public final class MockWebServer implements TestRule, Closeable {
         chunked = true;
       }
       if (lowercaseHeader.startsWith("expect:")
-          && lowercaseHeader.substring(7).trim().equals("100-continue")) {
+          && lowercaseHeader.substring(7).trim().equalsIgnoreCase("100-continue")) {
         expectContinue = true;
       }
     }
 
-    if (expectContinue) {
+    final SocketPolicy socketPolicy = dispatcher.peek().getSocketPolicy();
+    if (expectContinue && socketPolicy == EXPECT_CONTINUE || socketPolicy == CONTINUE_ALWAYS) {
       sink.writeUtf8("HTTP/1.1 100 Continue\r\n");
       sink.writeUtf8("Content-Length: 0\r\n");
       sink.writeUtf8("\r\n");
@@ -669,37 +675,36 @@ public final class MockWebServer implements TestRule, Closeable {
         .protocol(Protocol.HTTP_1_1)
         .build();
 
-    String name = request.getPath();
-    ThreadPoolExecutor replyExecutor =
-        new ThreadPoolExecutor(1, 1, 1, SECONDS, new LinkedBlockingDeque<Runnable>(),
-            Util.threadFactory(Util.format("MockWebServer %s WebSocket Replier", name), true));
-    replyExecutor.allowCoreThreadTimeOut(true);
-
     final CountDownLatch connectionClose = new CountDownLatch(1);
-    RealNewWebSocket.Streams streams = new RealNewWebSocket.Streams(false, source, sink) {
+    RealWebSocket.Streams streams = new RealWebSocket.Streams(false, source, sink) {
       @Override public void close() {
         connectionClose.countDown();
       }
     };
-    RealNewWebSocket webSocket = new RealNewWebSocket(fancyRequest,
-        response.getWebSocketListener(), new SecureRandom());
+    RealWebSocket webSocket = new RealWebSocket(fancyRequest,
+        response.getWebSocketListener(), new SecureRandom(), 0);
     response.getWebSocketListener().onOpen(webSocket, fancyResponse);
-    webSocket.initReaderAndWriter(streams);
-    webSocket.loopReader();
-
-    // Even if messages are no longer being read we need to wait for the connection close signal.
+    String name = "MockWebServer WebSocket " + request.getPath();
+    webSocket.initReaderAndWriter(name, streams);
     try {
-      connectionClose.await();
-    } catch (InterruptedException ignored) {
-    }
+      webSocket.loopReader();
 
-    replyExecutor.shutdown();
-    Util.closeQuietly(sink);
-    Util.closeQuietly(source);
+      // Even if messages are no longer being read we need to wait for the connection close signal.
+      try {
+        connectionClose.await();
+      } catch (InterruptedException ignored) {
+      }
+
+    } catch (IOException e) {
+      webSocket.failWebSocket(e, null);
+    } finally {
+      closeQuietly(source);
+    }
   }
 
   private void writeHttpResponse(Socket socket, BufferedSink sink, MockResponse response)
       throws IOException {
+    sleepIfDelayed(response.getBodyDelay(TimeUnit.MILLISECONDS));
     sink.writeUtf8(response.getStatus());
     sink.writeUtf8("\r\n");
 
@@ -715,12 +720,11 @@ public final class MockWebServer implements TestRule, Closeable {
 
     Buffer body = response.getBody();
     if (body == null) return;
-    sleepIfDelayed(response);
+    sleepIfDelayed(response.getBodyDelay(TimeUnit.MILLISECONDS));
     throttledTransfer(response, socket, body, sink, body.size(), false);
   }
 
-  private void sleepIfDelayed(MockResponse response) {
-    long delayMs = response.getBodyDelay(TimeUnit.MILLISECONDS);
+  private void sleepIfDelayed(long delayMs) {
     if (delayMs != 0) {
       try {
         Thread.sleep(delayMs);
@@ -840,13 +844,13 @@ public final class MockWebServer implements TestRule, Closeable {
     }
   }
 
-  /** Processes HTTP requests layered over framed protocols. */
-  private class FramedSocketHandler extends Http2Connection.Listener {
+  /** Processes HTTP requests layered over HTTP/2. */
+  private class Http2SocketHandler extends Http2Connection.Listener {
     private final Socket socket;
     private final Protocol protocol;
     private final AtomicInteger sequenceNumber = new AtomicInteger();
 
-    private FramedSocketHandler(Socket socket, Protocol protocol) {
+    private Http2SocketHandler(Socket socket, Protocol protocol) {
       this.socket = socket;
       this.protocol = protocol;
     }
@@ -866,11 +870,16 @@ public final class MockWebServer implements TestRule, Closeable {
       RecordedRequest request = readRequest(stream);
       requestCount.incrementAndGet();
       requestQueue.add(request);
+
       MockResponse response;
       try {
         response = dispatcher.dispatch(request);
       } catch (InterruptedException e) {
         throw new AssertionError(e);
+      }
+      if (response.getSocketPolicy() == DISCONNECT_AFTER_REQUEST) {
+        socket.close();
+        return;
       }
       writeResponse(stream, response);
       if (logger.isLoggable(Level.INFO)) {
@@ -889,6 +898,7 @@ public final class MockWebServer implements TestRule, Closeable {
       Headers.Builder httpHeaders = new Headers.Builder();
       String method = "<:method omitted>";
       String path = "<:path omitted>";
+      boolean readBody = true;
       for (int i = 0, size = streamHeaders.size(); i < size; i++) {
         ByteString name = streamHeaders.get(i).name;
         String value = streamHeaders.get(i).value.utf8();
@@ -896,20 +906,38 @@ public final class MockWebServer implements TestRule, Closeable {
           method = value;
         } else if (name.equals(Header.TARGET_PATH)) {
           path = value;
-        } else if (protocol == Protocol.HTTP_2) {
+        } else if (protocol == Protocol.HTTP_2 || protocol == Protocol.H2_PRIOR_KNOWLEDGE) {
           httpHeaders.add(name.utf8(), value);
         } else {
           throw new IllegalStateException();
         }
+        if (name.utf8().equals("expect") && value.equalsIgnoreCase("100-continue")) {
+          // Don't read the body unless we've invited the client to send it.
+          readBody = false;
+        }
+      }
+      Headers headers = httpHeaders.build();
+
+      MockResponse peek = dispatcher.peek();
+      if (!readBody && peek.getSocketPolicy() == EXPECT_CONTINUE) {
+        stream.sendResponseHeaders(Collections.singletonList(
+            new Header(Header.RESPONSE_STATUS, ByteString.encodeUtf8("100 Continue"))), true);
+        stream.getConnection().flush();
+        readBody = true;
       }
 
       Buffer body = new Buffer();
-      body.writeAll(stream.getSource());
-      body.close();
+      if (readBody) {
+        String contentLengthString = headers.get("content-length");
+        long byteCount = contentLengthString != null
+            ? Long.parseLong(contentLengthString)
+            : Long.MAX_VALUE;
+        throttledTransfer(peek, socket, Okio.buffer(stream.getSource()), body, byteCount, true);
+      }
 
       String requestLine = method + ' ' + path + " HTTP/1.1";
       List<Integer> chunkSizes = Collections.emptyList(); // No chunked encoding for HTTP/2.
-      return new RecordedRequest(requestLine, httpHeaders.build(), chunkSizes, body.size(), body,
+      return new RecordedRequest(requestLine, headers, chunkSizes, body.size(), body,
           sequenceNumber.getAndIncrement(), socket);
     }
 
@@ -923,8 +951,8 @@ public final class MockWebServer implements TestRule, Closeable {
         return;
       }
       List<Header> http2Headers = new ArrayList<>();
-      String[] statusParts = response.getStatus().split(" ", 2);
-      if (statusParts.length != 2) {
+      String[] statusParts = response.getStatus().split(" ", 3);
+      if (statusParts.length < 2) {
         throw new AssertionError("Unexpected status: " + response.getStatus());
       }
       // TODO: constants for well-known header names.
@@ -934,14 +962,16 @@ public final class MockWebServer implements TestRule, Closeable {
         http2Headers.add(new Header(headers.name(i), headers.value(i)));
       }
 
+      sleepIfDelayed(response.getHeadersDelay(TimeUnit.MILLISECONDS));
+
       Buffer body = response.getBody();
       boolean closeStreamAfterHeaders = body != null || !response.getPushPromises().isEmpty();
-      stream.reply(http2Headers, closeStreamAfterHeaders);
+      stream.sendResponseHeaders(http2Headers, closeStreamAfterHeaders);
       pushPromises(stream, response.getPushPromises());
       if (body != null) {
         BufferedSink sink = Okio.buffer(stream.getSink());
-        sleepIfDelayed(response);
-        throttledTransfer(response, socket, body, sink, bodyLimit, false);
+        sleepIfDelayed(response.getBodyDelay(TimeUnit.MILLISECONDS));
+        throttledTransfer(response, socket, body, sink, body.size(), false);
         sink.close();
       } else if (closeStreamAfterHeaders) {
         stream.close(ErrorCode.NO_ERROR);

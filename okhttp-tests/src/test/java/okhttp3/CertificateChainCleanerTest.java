@@ -21,11 +21,10 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 import javax.net.ssl.SSLPeerUnverifiedException;
-import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
-import okhttp3.internal.platform.Platform;
 import okhttp3.internal.tls.CertificateChainCleaner;
-import okhttp3.internal.tls.HeldCertificate;
+import okhttp3.mockwebserver.internal.tls.HeldCertificate;
+import okhttp3.mockwebserver.internal.tls.SslClient;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
@@ -45,9 +44,8 @@ public final class CertificateChainCleanerTest {
   }
 
   @Test public void equalsFromTrustManager() throws Exception {
-    Platform platform = Platform.get();
-    X509TrustManager x509TrustManager = platform.trustManager(
-        (SSLSocketFactory) SSLSocketFactory.getDefault());
+    SslClient client = new SslClient.Builder().build();
+    X509TrustManager x509TrustManager = client.trustManager;
     assertEquals(
         CertificateChainCleaner.get(x509TrustManager),
         CertificateChainCleaner.get(x509TrustManager));

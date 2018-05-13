@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014 Square, Inc.
+ * Copyright (C) 2018 Square, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,28 +13,33 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package okhttp3.internal.ws;
+package okhttp3;
 
-import java.io.IOException;
-import okhttp3.Response;
-import okhttp3.ResponseBody;
-import okhttp3.WebSocket;
-import okhttp3.WebSocketListener;
+import javax.annotation.Nullable;
 import okio.ByteString;
 
-public class EmptyWebSocketListener implements WebSocketListener {
+public final class RecordingWebSocketListener extends WebSocketListener {
   @Override public void onOpen(WebSocket webSocket, Response response) {
+    // TODO
   }
 
-  @Override public void onMessage(ResponseBody message) throws IOException {
+  @Override public void onMessage(WebSocket webSocket, String text) {
+    // TODO
   }
 
-  @Override public void onPong(ByteString payload) {
+  @Override public void onMessage(WebSocket webSocket, ByteString bytes) {
+    // TODO
   }
 
-  @Override public void onClose(int code, String reason) {
+  @Override public void onClosing(WebSocket webSocket, int code, String reason) {
+    // TODO
   }
 
-  @Override public void onFailure(Throwable t, Response response) {
+  @Override public void onClosed(WebSocket webSocket, int code, String reason) {
+    // TODO
+  }
+
+  @Override public void onFailure(WebSocket webSocket, Throwable t, @Nullable Response response) {
+    // TODO
   }
 }

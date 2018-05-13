@@ -27,6 +27,7 @@ import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -50,6 +51,14 @@ public final class CookieTest {
     assertNull(Cookie.parse(url, "\r\t \n=b"));
   }
 
+  @Test public void spaceInName() throws Exception {
+    assertEquals("a b", Cookie.parse(url, "a b=cd").name());
+  }
+
+  @Test public void spaceInValue() throws Exception {
+    assertEquals("c d", Cookie.parse(url, "ab=c d").value());
+  }
+
   @Test public void trimLeadingAndTrailingWhitespaceFromName() throws Exception {
     assertEquals("a", Cookie.parse(url, " a=b").name());
     assertEquals("a", Cookie.parse(url, "a =b").name());
@@ -67,6 +76,23 @@ public final class CookieTest {
     assertEquals("b", Cookie.parse(url, "a= b").value());
     assertEquals("b", Cookie.parse(url, "a=b ").value());
     assertEquals("b", Cookie.parse(url, "a=\r\t \nb\n\t \n").value());
+  }
+
+  @Test public void invalidCharacters() throws Exception {
+    assertEquals(null, Cookie.parse(url, "a\u0000b=cd"));
+    assertEquals(null, Cookie.parse(url, "ab=c\u0000d"));
+    assertEquals(null, Cookie.parse(url, "a\u0001b=cd"));
+    assertEquals(null, Cookie.parse(url, "ab=c\u0001d"));
+    assertEquals(null, Cookie.parse(url, "a\u0009b=cd"));
+    assertEquals(null, Cookie.parse(url, "ab=c\u0009d"));
+    assertEquals(null, Cookie.parse(url, "a\u001fb=cd"));
+    assertEquals(null, Cookie.parse(url, "ab=c\u001fd"));
+    assertEquals(null, Cookie.parse(url, "a\u007fb=cd"));
+    assertEquals(null, Cookie.parse(url, "ab=c\u007fd"));
+    assertEquals(null, Cookie.parse(url, "a\u0080b=cd"));
+    assertEquals(null, Cookie.parse(url, "ab=c\u0080d"));
+    assertEquals(null, Cookie.parse(url, "a\u00ffb=cd"));
+    assertEquals(null, Cookie.parse(url, "ab=c\u00ffd"));
   }
 
   @Test public void maxAge() throws Exception {
@@ -239,6 +265,55 @@ public final class CookieTest {
     HttpUrl urlWithIp = HttpUrl.parse("http://123.45.234.56/");
     assertNull(Cookie.parse(urlWithIp, "a=b; domain=234.56"));
     assertEquals("123.45.234.56", Cookie.parse(urlWithIp, "a=b; domain=123.45.234.56").domain());
+  }
+
+  @Test public void domainMatchesIpv6Address() throws Exception {
+    Cookie cookie = Cookie.parse(HttpUrl.parse("http://[::1]/"), "a=b; domain=::1");
+    assertEquals("::1", cookie.domain());
+    assertTrue(cookie.matches(HttpUrl.parse("http://[::1]/")));
+  }
+
+  @Test public void domainMatchesIpv6AddressWithCompression() throws Exception {
+    Cookie cookie = Cookie.parse(HttpUrl.parse("http://[0001:0000::]/"), "a=b; domain=0001:0000::");
+    assertEquals("1::", cookie.domain());
+    assertTrue(cookie.matches(HttpUrl.parse("http://[1::]/")));
+  }
+
+  @Test public void domainMatchesIpv6AddressWithIpv4Suffix() throws Exception {
+    Cookie cookie = Cookie.parse(
+        HttpUrl.parse("http://[::1:ffff:ffff]/"), "a=b; domain=::1:255.255.255.255");
+    assertEquals("::1:ffff:ffff", cookie.domain());
+    assertTrue(cookie.matches(HttpUrl.parse("http://[::1:ffff:ffff]/")));
+  }
+
+  @Test public void ipv6AddressDoesntMatch() throws Exception {
+    Cookie cookie = Cookie.parse(HttpUrl.parse("http://[::1]/"), "a=b; domain=::2");
+    assertNull(cookie);
+  }
+
+  @Test public void ipv6AddressMalformed() throws Exception {
+    Cookie cookie = Cookie.parse(HttpUrl.parse("http://[::1]/"), "a=b; domain=::2::2");
+    assertEquals("::1", cookie.domain());
+  }
+
+  /**
+   * These public suffixes were selected by inspecting the publicsuffix.org list. It's possible they
+   * may change in the future. If this test begins to fail, please double check they are still
+   * present in the public suffix list.
+   */
+  @Test public void domainIsPublicSuffix() {
+    HttpUrl ascii = HttpUrl.parse("https://foo1.foo.bar.elb.amazonaws.com");
+    assertNotNull(Cookie.parse(ascii, "a=b; domain=foo.bar.elb.amazonaws.com"));
+    assertNull(Cookie.parse(ascii, "a=b; domain=bar.elb.amazonaws.com"));
+    assertNull(Cookie.parse(ascii, "a=b; domain=com"));
+
+    HttpUrl unicode = HttpUrl.parse("https://長.長.長崎.jp");
+    assertNotNull(Cookie.parse(unicode, "a=b; domain=長.長崎.jp"));
+    assertNull(Cookie.parse(unicode, "a=b; domain=長崎.jp"));
+
+    HttpUrl punycode = HttpUrl.parse("https://xn--ue5a.xn--ue5a.xn--8ltr62k.jp");
+    assertNotNull(Cookie.parse(punycode, "a=b; domain=xn--ue5a.xn--8ltr62k.jp"));
+    assertNull(Cookie.parse(punycode, "a=b; domain=xn--8ltr62k.jp"));
   }
 
   @Test public void hostOnly() throws Exception {
@@ -459,6 +534,15 @@ public final class CookieTest {
         .httpOnly()
         .build();
     assertEquals(true, cookie.httpOnly());
+  }
+
+  @Test public void builderIpv6() throws Exception {
+    Cookie cookie = new Cookie.Builder()
+        .name("a")
+        .value("b")
+        .domain("0:0:0:0:0:0:0:1")
+        .build();
+    assertEquals("::1", cookie.domain());
   }
 
   @Test public void equalsAndHashCode() throws Exception {

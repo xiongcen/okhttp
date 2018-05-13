@@ -20,9 +20,12 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.List;
+import javax.annotation.Nullable;
 import javax.net.ssl.SSLSocket;
 import okhttp3.Protocol;
 import okhttp3.internal.Util;
+
+import static okhttp3.internal.Util.assertionError;
 
 /**
  * OpenJDK 7 or OpenJDK 8 with {@code org.mortbay.jetty.alpn/alpn-boot} in the boot class path.
@@ -34,7 +37,7 @@ class JdkWithJettyBootPlatform extends Platform {
   private final Class<?> clientProviderClass;
   private final Class<?> serverProviderClass;
 
-  public JdkWithJettyBootPlatform(Method putMethod, Method getMethod, Method removeMethod,
+  JdkWithJettyBootPlatform(Method putMethod, Method getMethod, Method removeMethod,
       Class<?> clientProviderClass, Class<?> serverProviderClass) {
     this.putMethod = putMethod;
     this.getMethod = getMethod;
@@ -52,19 +55,19 @@ class JdkWithJettyBootPlatform extends Platform {
           new Class[] {clientProviderClass, serverProviderClass}, new JettyNegoProvider(names));
       putMethod.invoke(null, sslSocket, provider);
     } catch (InvocationTargetException | IllegalAccessException e) {
-      throw new AssertionError(e);
+      throw assertionError("unable to set alpn", e);
     }
   }
 
   @Override public void afterHandshake(SSLSocket sslSocket) {
     try {
       removeMethod.invoke(null, sslSocket);
-    } catch (IllegalAccessException | InvocationTargetException ignored) {
-      throw new AssertionError();
+    } catch (IllegalAccessException | InvocationTargetException e) {
+      throw assertionError("unable to remove alpn", e);
     }
   }
 
-  @Override public String getSelectedProtocol(SSLSocket socket) {
+  @Override public @Nullable String getSelectedProtocol(SSLSocket socket) {
     try {
       JettyNegoProvider provider =
           (JettyNegoProvider) Proxy.getInvocationHandler(getMethod.invoke(null, socket));
@@ -75,7 +78,7 @@ class JdkWithJettyBootPlatform extends Platform {
       }
       return provider.unsupported ? null : provider.selected;
     } catch (InvocationTargetException | IllegalAccessException e) {
-      throw new AssertionError();
+      throw assertionError("unable to get selected protocol", e);
     }
   }
 
@@ -106,11 +109,11 @@ class JdkWithJettyBootPlatform extends Platform {
     /** This peer's supported protocols. */
     private final List<String> protocols;
     /** Set when remote peer notifies ALPN is unsupported. */
-    private boolean unsupported;
+    boolean unsupported;
     /** The protocol the server selected. */
-    private String selected;
+    String selected;
 
-    public JettyNegoProvider(List<String> protocols) {
+    JettyNegoProvider(List<String> protocols) {
       this.protocols = protocols;
     }
 

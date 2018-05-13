@@ -21,8 +21,11 @@ import okhttp3.Interceptor;
 import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.internal.Util;
+import okhttp3.internal.connection.RealConnection;
 import okhttp3.internal.connection.StreamAllocation;
+import okio.Buffer;
 import okio.BufferedSink;
+import okio.ForwardingSink;
 import okio.Okio;
 import okio.Sink;
 
@@ -35,26 +38,57 @@ public final class CallServerInterceptor implements Interceptor {
   }
 
   @Override public Response intercept(Chain chain) throws IOException {
-    HttpCodec httpCodec = ((RealInterceptorChain) chain).httpStream();
-    StreamAllocation streamAllocation = ((RealInterceptorChain) chain).streamAllocation();
-    Request request = chain.request();
+    RealInterceptorChain realChain = (RealInterceptorChain) chain;
+    HttpCodec httpCodec = realChain.httpStream();
+    StreamAllocation streamAllocation = realChain.streamAllocation();
+    RealConnection connection = (RealConnection) realChain.connection();
+    Request request = realChain.request();
 
     long sentRequestMillis = System.currentTimeMillis();
-    // 1.向服务器发送 request header；
-    httpCodec.writeRequestHeaders(request);
 
-    // 2.如果有 request body，就向服务器发送；
+    realChain.eventListener().requestHeadersStart(realChain.call());
+    httpCodec.writeRequestHeaders(request);
+    realChain.eventListener().requestHeadersEnd(realChain.call(), request);
+
+    Response.Builder responseBuilder = null;
     if (HttpMethod.permitsRequestBody(request.method()) && request.body() != null) {
-      Sink requestBodyOut = httpCodec.createRequestBody(request, request.body().contentLength());
-      BufferedSink bufferedRequestBody = Okio.buffer(requestBodyOut);
-      request.body().writeTo(bufferedRequestBody);
-      bufferedRequestBody.close();
+      // If there's a "Expect: 100-continue" header on the request, wait for a "HTTP/1.1 100
+      // Continue" response before transmitting the request body. If we don't get that, return
+      // what we did get (such as a 4xx response) without ever transmitting the request body.
+      if ("100-continue".equalsIgnoreCase(request.header("Expect"))) {
+        httpCodec.flushRequest();
+        realChain.eventListener().responseHeadersStart(realChain.call());
+        responseBuilder = httpCodec.readResponseHeaders(true);
+      }
+
+      if (responseBuilder == null) {
+        // Write the request body if the "Expect: 100-continue" expectation was met.
+        realChain.eventListener().requestBodyStart(realChain.call());
+        long contentLength = request.body().contentLength();
+        CountingSink requestBodyOut =
+            new CountingSink(httpCodec.createRequestBody(request, contentLength));
+        BufferedSink bufferedRequestBody = Okio.buffer(requestBodyOut);
+
+        request.body().writeTo(bufferedRequestBody);
+        bufferedRequestBody.close();
+        realChain.eventListener()
+            .requestBodyEnd(realChain.call(), requestBodyOut.successfulCount);
+      } else if (!connection.isMultiplexed()) {
+        // If the "Expect: 100-continue" expectation wasn't met, prevent the HTTP/1 connection
+        // from being reused. Otherwise we're still obligated to transmit the request body to
+        // leave the connection in a consistent state.
+        streamAllocation.noNewStreams();
+      }
     }
 
     httpCodec.finishRequest();
 
-    // 3.读取 response header，先构造一个 Response 对象；
-    Response response = httpCodec.readResponseHeaders()
+    if (responseBuilder == null) {
+      realChain.eventListener().responseHeadersStart(realChain.call());
+      responseBuilder = httpCodec.readResponseHeaders(false);
+    }
+
+    Response response = responseBuilder
         .request(request)
         .handshake(streamAllocation.connection().handshake())
         .sentRequestAtMillis(sentRequestMillis)
@@ -62,13 +96,30 @@ public final class CallServerInterceptor implements Interceptor {
         .build();
 
     int code = response.code();
+    if (code == 100) {
+      // server sent a 100-continue even though we did not request one.
+      // try again to read the actual response
+      responseBuilder = httpCodec.readResponseHeaders(false);
+
+      response = responseBuilder
+              .request(request)
+              .handshake(streamAllocation.connection().handshake())
+              .sentRequestAtMillis(sentRequestMillis)
+              .receivedResponseAtMillis(System.currentTimeMillis())
+              .build();
+
+      code = response.code();
+    }
+
+    realChain.eventListener()
+            .responseHeadersEnd(realChain.call(), response);
+
     if (forWebSocket && code == 101) {
       // Connection is upgrading, but we need to ensure interceptors see a non-null response body.
       response = response.newBuilder()
           .body(Util.EMPTY_RESPONSE)
           .build();
     } else {
-      // 4.如果有 response body，就在 步骤3 的基础上加上 body 构造一个新的 Response 对象；
       response = response.newBuilder()
           .body(httpCodec.openResponseBody(response))
           .build();
@@ -85,5 +136,18 @@ public final class CallServerInterceptor implements Interceptor {
     }
 
     return response;
+  }
+
+  static final class CountingSink extends ForwardingSink {
+    long successfulCount;
+
+    CountingSink(Sink delegate) {
+      super(delegate);
+    }
+
+    @Override public void write(Buffer source, long byteCount) throws IOException {
+      super.write(source, byteCount);
+      successfulCount += byteCount;
+    }
   }
 }

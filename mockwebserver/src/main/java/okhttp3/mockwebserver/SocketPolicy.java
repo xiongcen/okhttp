@@ -88,8 +88,14 @@ public enum SocketPolicy {
   SHUTDOWN_OUTPUT_AT_END,
 
   /**
-   * Don't respond to the request but keep the socket open. For testing read response header timeout
-   * issue.
+   * After accepting the connection and doing TLS (if configured) don't do HTTP/1.1 or HTTP/2
+   * framing. Ignore the socket completely until the server is shut down.
+   */
+  STALL_SOCKET_AT_START,
+
+  /**
+   * Read the request but don't respond to it. Just keep the socket open. For testing read response
+   * header timeout issue.
    */
   NO_RESPONSE,
 
@@ -97,5 +103,18 @@ public enum SocketPolicy {
    * Fail HTTP/2 requests without processing them by sending an {@linkplain
    * MockResponse#getHttp2ErrorCode() HTTP/2 error code}.
    */
-  RESET_STREAM_AT_START
+  RESET_STREAM_AT_START,
+
+  /**
+   * Transmit a {@code HTTP/1.1 100 Continue} response before reading the HTTP request body.
+   * Typically this response is sent when a client makes a request with the header {@code
+   * Expect: 100-continue}.
+   */
+  EXPECT_CONTINUE,
+
+  /**
+   * Transmit a {@code HTTP/1.1 100 Continue} response before reading the HTTP request body even
+   * if the client does not send the header {@code Expect: 100-continue} in its request.
+   */
+  CONTINUE_ALWAYS
 }

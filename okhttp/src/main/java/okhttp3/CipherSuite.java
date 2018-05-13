@@ -15,8 +15,12 @@
  */
 package okhttp3;
 
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * <a href="https://www.iana.org/assignments/tls-parameters/tls-parameters.xhtml">TLS cipher
@@ -25,17 +29,42 @@ import java.util.concurrent.ConcurrentMap;
  * <p><strong>Not all cipher suites are supported on all platforms.</strong> As newer cipher suites
  * are created (for stronger privacy, better performance, etc.) they will be adopted by the platform
  * and then exposed here. Cipher suites that are not available on either Android (through API level
- * 20) or Java (through JDK 8) are omitted for brevity.
+ * 24) or Java (through JDK 9) are omitted for brevity.
  *
- * <p>See also <a href="https://android.googlesource.com/platform/external/conscrypt/+/master/src/main/java/org/conscrypt/NativeCrypto.java">NativeCrypto.java</a>
- * from conscrypt, which lists the cipher suites supported by Android.
+ * <p>See <a href="https://developer.android.com/reference/javax/net/ssl/SSLEngine.html">Android SSLEngine</a>
+ * which lists the cipher suites supported by Android.
+ *
+ * <p>See <a href="https://docs.oracle.com/javase/9/security/oracleproviders.htm">JDK 9 Providers</a>
+ * which lists the cipher suites supported by Oracle.
+ *
+ * <p>See <a href="https://github.com/google/conscrypt/blob/master/common/src/main/java/org/conscrypt/NativeCrypto.java">NativeCrypto.java</a>
+ * from conscrypt, which lists the cipher suites supported by Conscrypt.
  */
 public final class CipherSuite {
   /**
-   * Holds interned instances. This needs to be above the of() calls below so that it's
-   * initialized by the time those parts of {@code <clinit>()} run.
+   * Compares cipher suites names like "TLS_RSA_WITH_NULL_MD5" and "SSL_RSA_WITH_NULL_MD5", ignoring
+   * the "TLS_" or "SSL_" prefix which is not consistent across platforms. In particular some IBM
+   * JVMs use the "SSL_" prefix everywhere whereas Oracle JVMs mix "TLS_" and "SSL_".
    */
-  private static final ConcurrentMap<String, CipherSuite> INSTANCES = new ConcurrentHashMap<>();
+  static final Comparator<String> ORDER_BY_NAME = new Comparator<String>() {
+    @Override public int compare(String a, String b) {
+      for (int i = 4, limit = Math.min(a.length(), b.length()); i < limit; i++) {
+        char charA = a.charAt(i);
+        char charB = b.charAt(i);
+        if (charA != charB) return charA < charB ? -1 : 1;
+      }
+      int lengthA = a.length();
+      int lengthB = b.length();
+      if (lengthA != lengthB) return lengthA < lengthB ? -1 : 1;
+      return 0;
+    }
+  };
+
+  /**
+   * Holds interned instances. This needs to be above the of() calls below so that it's
+   * initialized by the time those parts of {@code <clinit>()} run. Guarded by CipherSuite.class.
+   */
+  private static final Map<String, CipherSuite> INSTANCES = new TreeMap<>(ORDER_BY_NAME);
 
   // Last updated 2016-07-03 using cipher suites from Android 24 and Java 9.
 
@@ -362,7 +391,7 @@ public final class CipherSuite {
   public static final CipherSuite TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 = of("TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", 0xcca9);
   // public static final CipherSuite TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256 = of("TLS_DHE_RSA_WITH_CHACHA20_POLY1305_SHA256", 0xccaa);
   // public static final CipherSuite TLS_PSK_WITH_CHACHA20_POLY1305_SHA256 = of("TLS_PSK_WITH_CHACHA20_POLY1305_SHA256", 0xccab);
-  // public static final CipherSuite TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 = of("TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256", 0xccac);
+   public static final CipherSuite TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256 = of("TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256", 0xccac);
   // public static final CipherSuite TLS_DHE_PSK_WITH_CHACHA20_POLY1305_SHA256 = of("TLS_DHE_PSK_WITH_CHACHA20_POLY1305_SHA256", 0xccad);
   // public static final CipherSuite TLS_RSA_PSK_WITH_CHACHA20_POLY1305_SHA256 = of("TLS_RSA_PSK_WITH_CHACHA20_POLY1305_SHA256", 0xccae);
 
@@ -370,16 +399,23 @@ public final class CipherSuite {
 
   /**
    * @param javaName the name used by Java APIs for this cipher suite. Different than the IANA name
-   * for older cipher suites because the prefix is {@code SSL_} instead of {@code TLS_}.
+   *     for older cipher suites because the prefix is {@code SSL_} instead of {@code TLS_}.
    */
-  public static CipherSuite forJavaName(String javaName) {
+  public static synchronized CipherSuite forJavaName(String javaName) {
     CipherSuite result = INSTANCES.get(javaName);
     if (result == null) {
-      CipherSuite sample = new CipherSuite(javaName);
-      CipherSuite canonical = INSTANCES.putIfAbsent(javaName, sample);
-      result = (canonical == null) ? sample : canonical;
+      result = new CipherSuite(javaName);
+      INSTANCES.put(javaName, result);
     }
     return result;
+  }
+
+  static List<CipherSuite> forJavaNames(String... cipherSuites) {
+    List<CipherSuite> result = new ArrayList<>(cipherSuites.length);
+    for (String cipherSuite : cipherSuites) {
+      result.add(forJavaName(cipherSuite));
+    }
+    return Collections.unmodifiableList(result);
   }
 
   private CipherSuite(String javaName) {
@@ -391,7 +427,7 @@ public final class CipherSuite {
 
   /**
    * @param javaName the name used by Java APIs for this cipher suite. Different than the IANA name
-   * for older cipher suites because the prefix is {@code SSL_} instead of {@code TLS_}.
+   *     for older cipher suites because the prefix is {@code SSL_} instead of {@code TLS_}.
    * @param value the integer identifier for this cipher suite. (Documentation only.)
    */
   private static CipherSuite of(String javaName, int value) {

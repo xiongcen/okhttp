@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package okhttp3.internal.http2;
+package okhttp3.mockwebserver.internal.http2;
 
 import java.io.File;
 import java.io.IOException;
@@ -30,8 +30,11 @@ import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import okhttp3.Protocol;
 import okhttp3.internal.Util;
+import okhttp3.internal.http2.Header;
+import okhttp3.internal.http2.Http2Connection;
+import okhttp3.internal.http2.Http2Stream;
 import okhttp3.internal.platform.Platform;
-import okhttp3.internal.tls.SslClient;
+import okhttp3.mockwebserver.internal.tls.SslClient;
 import okio.BufferedSink;
 import okio.Okio;
 import okio.Source;
@@ -71,10 +74,10 @@ public final class Http2Server extends Http2Connection.Listener {
             .build();
         connection.start();
       } catch (IOException e) {
-        logger.log(Level.INFO, "FramedServer connection failure: " + e);
+        logger.log(Level.INFO, "Http2Server connection failure: " + e);
         Util.closeQuietly(socket);
       } catch (Exception e) {
-        logger.log(Level.WARNING, "FramedServer unexpected failure", e);
+        logger.log(Level.WARNING, "Http2Server unexpected failure", e);
         Util.closeQuietly(socket);
       }
     }
@@ -90,7 +93,7 @@ public final class Http2Server extends Http2Connection.Listener {
     return sslSocket;
   }
 
-  @Override public void onStream(final Http2Stream stream) throws IOException {
+  @Override public void onStream(Http2Stream stream) throws IOException {
     try {
       List<Header> requestHeaders = stream.getRequestHeaders();
       String path = null;
@@ -116,7 +119,7 @@ public final class Http2Server extends Http2Connection.Listener {
         send404(stream, path);
       }
     } catch (IOException e) {
-      Platform.get().log(INFO, "Failure serving FramedStream: " + e.getMessage(), null);
+      Platform.get().log(INFO, "Failure serving Http2Stream: " + e.getMessage(), null);
     }
   }
 
@@ -126,7 +129,7 @@ public final class Http2Server extends Http2Connection.Listener {
         new Header(":version", "HTTP/1.1"),
         new Header("content-type", "text/plain")
     );
-    stream.reply(responseHeaders, true);
+    stream.sendResponseHeaders(responseHeaders, true);
     BufferedSink out = Okio.buffer(stream.getSink());
     out.writeUtf8("Not found: " + path);
     out.close();
@@ -138,7 +141,7 @@ public final class Http2Server extends Http2Connection.Listener {
         new Header(":version", "HTTP/1.1"),
         new Header("content-type", "text/html; charset=UTF-8")
     );
-    stream.reply(responseHeaders, true);
+    stream.sendResponseHeaders(responseHeaders, true);
     BufferedSink out = Okio.buffer(stream.getSink());
     for (File file : files) {
       String target = file.isDirectory() ? (file.getName() + "/") : file.getName();
@@ -153,7 +156,7 @@ public final class Http2Server extends Http2Connection.Listener {
         new Header(":version", "HTTP/1.1"),
         new Header("content-type", contentType(file))
     );
-    stream.reply(responseHeaders, true);
+    stream.sendResponseHeaders(responseHeaders, true);
     Source source = Okio.source(file);
     try {
       BufferedSink out = Okio.buffer(stream.getSink());
@@ -177,7 +180,7 @@ public final class Http2Server extends Http2Connection.Listener {
 
   public static void main(String... args) throws Exception {
     if (args.length != 1 || args[0].startsWith("-")) {
-      System.out.println("Usage: FramedServer <base directory>");
+      System.out.println("Usage: Http2Server <base directory>");
       return;
     }
 

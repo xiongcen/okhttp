@@ -143,15 +143,31 @@ public final class RecordedResponse {
     return new RecordedResponse(cacheResponse.request(), cacheResponse, null, null, null);
   }
 
-  public RecordedResponse assertFailure(Class<?> exceptionClass) {
-    assertTrue(exceptionClass.isInstance(failure));
+  public RecordedResponse assertFailure(Class<?>... allowedExceptionTypes) {
+    boolean found = false;
+    for (Class expectedClass : allowedExceptionTypes) {
+      if (expectedClass.isInstance(failure)) {
+        found = true;
+        break;
+      }
+    }
+    assertTrue("Expected exception type among " + Arrays.toString(allowedExceptionTypes)
+            + ", got " + failure, found);
     return this;
   }
 
   public RecordedResponse assertFailure(String... messages) {
-    assertNotNull(failure);
+    assertNotNull("No failure found", failure);
     assertTrue(failure.getMessage(), Arrays.asList(messages).contains(failure.getMessage()));
     return this;
+  }
+
+  public RecordedResponse assertFailureMatches(String... patterns) {
+    assertNotNull(failure);
+    for (String pattern : patterns) {
+      if (failure.getMessage().matches(pattern)) return this;
+    }
+    throw new AssertionError(failure.getMessage());
   }
 
   public RecordedResponse assertSentRequestAtMillis(long minimum, long maximum) {

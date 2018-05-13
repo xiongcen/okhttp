@@ -27,12 +27,15 @@ import java.net.ProtocolException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.URLConnection;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import okhttp3.Headers;
+import okhttp3.HttpUrl;
+import okhttp3.Protocol;
 import okhttp3.internal.Util;
 import org.junit.After;
 import org.junit.Rule;
@@ -103,6 +106,17 @@ public final class MockWebServerTest {
         .addHeader("Cookies: delicious");
     response.setHeader("cookie", "r=robot");
     assertEquals(Arrays.asList("Cookies: delicious", "cookie: r=robot"), headersToList(response));
+  }
+
+  @Test public void mockResponseSetHeaders() {
+    MockResponse response = new MockResponse()
+        .clearHeaders()
+        .addHeader("Cookie: s=square")
+        .addHeader("Cookies: delicious");
+
+    response.setHeaders(new Headers.Builder().add("Cookie", "a=android").build());
+
+    assertEquals(Arrays.asList("Cookie: a=android"), headersToList(response));
   }
 
   @Test public void regularResponse() throws Exception {
@@ -404,5 +418,71 @@ public final class MockWebServerTest {
 
     // Shutting down the server should unblock the dispatcher.
     server.shutdown();
+  }
+
+  @Test public void requestUrlReconstructed() throws Exception {
+    server.enqueue(new MockResponse().setBody("hello world"));
+
+    URL url = server.url("/a/deep/path?key=foo%20bar").url();
+    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+    InputStream in = connection.getInputStream();
+    BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+    assertEquals(HttpURLConnection.HTTP_OK, connection.getResponseCode());
+    assertEquals("hello world", reader.readLine());
+
+    RecordedRequest request = server.takeRequest();
+    assertEquals("GET /a/deep/path?key=foo%20bar HTTP/1.1", request.getRequestLine());
+
+    HttpUrl requestUrl = request.getRequestUrl();
+    assertEquals("http", requestUrl.scheme());
+    assertEquals(server.getHostName(), requestUrl.host());
+    assertEquals(server.getPort(), requestUrl.port());
+    assertEquals("/a/deep/path", requestUrl.encodedPath());
+    assertEquals("foo bar", requestUrl.queryParameter("key"));
+  }
+
+  @Test public void http100Continue() throws Exception {
+    server.enqueue(new MockResponse().setBody("response"));
+
+    URL url = server.url("/").url();
+    HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+    connection.setDoOutput(true);
+    connection.setRequestProperty("Expect", "100-Continue");
+    connection.getOutputStream().write("request".getBytes(StandardCharsets.UTF_8));
+
+    InputStream in = connection.getInputStream();
+    BufferedReader reader = new BufferedReader(new InputStreamReader(in));
+    assertEquals("response", reader.readLine());
+
+    RecordedRequest request = server.takeRequest();
+    assertEquals("request", request.getBody().readUtf8());
+  }
+
+  @Test public void testH2PriorKnowledgeServerFallback() {
+    try {
+      server.setProtocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE, Protocol.HTTP_1_1));
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("protocols containing h2_prior_knowledge cannot use other protocols: "
+              + "[h2_prior_knowledge, http/1.1]", expected.getMessage());
+    }
+  }
+
+  @Test public void testH2PriorKnowledgeServerDuplicates() {
+    try {
+      // Treating this use case as user error
+      server.setProtocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE, Protocol.H2_PRIOR_KNOWLEDGE));
+      fail();
+    } catch (IllegalArgumentException expected) {
+      assertEquals("protocols containing h2_prior_knowledge cannot use other protocols: "
+          + "[h2_prior_knowledge, h2_prior_knowledge]", expected.getMessage());
+    }
+  }
+
+  @Test public void testMockWebServerH2PriorKnowledgeProtocol() {
+    server.setProtocols(Arrays.asList(Protocol.H2_PRIOR_KNOWLEDGE));
+
+    assertEquals(1, server.protocols().size());
+    assertEquals(Protocol.H2_PRIOR_KNOWLEDGE, server.protocols().get(0));
   }
 }

@@ -18,25 +18,26 @@ package okhttp3.internal.ws;
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.ProtocolException;
+import java.net.SocketTimeoutException;
 import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
 import okhttp3.Call;
 import okhttp3.Callback;
-import okhttp3.NewWebSocket;
+import okhttp3.EventListener;
 import okhttp3.OkHttpClient;
 import okhttp3.Protocol;
 import okhttp3.Request;
 import okhttp3.Response;
-import okhttp3.ResponseBody;
 import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
 import okhttp3.internal.Internal;
-import okhttp3.internal.NamedRunnable;
 import okhttp3.internal.Util;
 import okhttp3.internal.connection.StreamAllocation;
 import okio.BufferedSink;
@@ -44,52 +45,53 @@ import okio.BufferedSource;
 import okio.ByteString;
 import okio.Okio;
 
-import static java.util.concurrent.TimeUnit.SECONDS;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static okhttp3.internal.Util.closeQuietly;
 import static okhttp3.internal.ws.WebSocketProtocol.CLOSE_CLIENT_GOING_AWAY;
+import static okhttp3.internal.ws.WebSocketProtocol.CLOSE_MESSAGE_MAX;
 import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_BINARY;
 import static okhttp3.internal.ws.WebSocketProtocol.OPCODE_TEXT;
+import static okhttp3.internal.ws.WebSocketProtocol.validateCloseCode;
 
-public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.FrameCallback {
+public final class RealWebSocket implements WebSocket, WebSocketReader.FrameCallback {
   private static final List<Protocol> ONLY_HTTP1 = Collections.singletonList(Protocol.HTTP_1_1);
 
   /**
    * The maximum number of bytes to enqueue. Rather than enqueueing beyond this limit we tear down
    * the web socket! It's possible that we're writing faster than the peer can read.
    */
-  private static final long MAX_QUEUE_SIZE = 1024 * 1024; // 1 MiB.
+  private static final long MAX_QUEUE_SIZE = 16 * 1024 * 1024; // 16 MiB.
 
-  /** A shared executor for all web sockets. */
-  private static final ExecutorService executor = new ThreadPoolExecutor(0,
-      Integer.MAX_VALUE, 60, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(),
-      Util.threadFactory("OkHttp WebSocket", true));
+  /**
+   * The maximum amount of time after the client calls {@link #close} to wait for a graceful
+   * shutdown. If the server doesn't respond the websocket will be canceled.
+   */
+  private static final long CANCEL_AFTER_CLOSE_MILLIS = 60 * 1000;
 
   /** The application's original request unadulterated by web socket headers. */
   private final Request originalRequest;
 
-  private final Listener listener;
+  final WebSocketListener listener;
   private final Random random;
+  private final long pingIntervalMillis;
   private final String key;
 
-  /** Non-null for client websockets. These can be canceled. */
+  /** Non-null for client web sockets. These can be canceled. */
   private Call call;
 
   /** This runnable processes the outgoing queues. Call {@link #runWriter()} to after enqueueing. */
-  private final NamedRunnable writerRunnable;
+  private final Runnable writerRunnable;
 
   /** Null until this web socket is connected. Only accessed by the reader thread. */
   private WebSocketReader reader;
 
   // All mutable web socket state is guarded by this.
 
-  /**
-   * True if {@link #writerRunnable} is active. Because writing is single-threaded we only enqueue
-   * it if it isn't already enqueued.
-   */
-  private boolean writerRunning;
-
   /** Null until this web socket is connected. Note that messages may be enqueued before that. */
   private WebSocketWriter writer;
+
+  /** Null until this web socket is connected. Used for writes, pings, and close timeouts. */
+  private ScheduledExecutorService executor;
 
   /**
    * The streams held by this web socket. This is non-null until all incoming messages have been
@@ -110,6 +112,12 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
   /** True if we've enqueued a close frame. No further message frames will be enqueued. */
   private boolean enqueuedClose;
 
+  /**
+   * When executed this will cancel this websocket. This future itself should be canceled if that is
+   * unnecessary because the web socket is already closed or canceled.
+   */
+  private ScheduledFuture<?> cancelFuture;
+
   /** The close code from the peer, or -1 if this web socket has not yet read a close frame. */
   private int receivedCloseCode = -1;
 
@@ -119,20 +127,34 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
   /** True if this web socket failed and the listener has been notified. */
   private boolean failed;
 
-  public RealNewWebSocket(Request request, Listener listener, Random random) {
+  /** Total number of pings sent by this web socket. */
+  private int sentPingCount;
+
+  /** Total number of pings received by this web socket. */
+  private int receivedPingCount;
+
+  /** Total number of pongs received by this web socket. */
+  private int receivedPongCount;
+
+  /** True if we have sent a ping that is still awaiting a reply. */
+  private boolean awaitingPong;
+
+  public RealWebSocket(Request request, WebSocketListener listener, Random random,
+      long pingIntervalMillis) {
     if (!"GET".equals(request.method())) {
       throw new IllegalArgumentException("Request must be GET: " + request.method());
     }
     this.originalRequest = request;
     this.listener = listener;
     this.random = random;
+    this.pingIntervalMillis = pingIntervalMillis;
 
     byte[] nonce = new byte[16];
     random.nextBytes(nonce);
     this.key = ByteString.of(nonce).base64();
 
-    this.writerRunnable = new NamedRunnable("OkHttp WebSocket %s", request.url().redact()) {
-      @Override protected void execute() {
+    this.writerRunnable = new Runnable() {
+      @Override public void run() {
         try {
           while (writeOneFrame()) {
           }
@@ -157,11 +179,10 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
 
   public void connect(OkHttpClient client) {
     client = client.newBuilder()
-        .readTimeout(0, SECONDS) // i.e., no timeout because this is a long-lived connection.
-        .writeTimeout(0, SECONDS) // i.e., no timeout because this is a long-lived connection.
+        .eventListener(EventListener.NONE)
         .protocols(ONLY_HTTP1)
         .build();
-    Request request = originalRequest.newBuilder()
+    final Request request = originalRequest.newBuilder()
         .header("Upgrade", "websocket")
         .header("Connection", "Upgrade")
         .header("Sec-WebSocket-Key", key)
@@ -181,12 +202,14 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
         // Promote the HTTP streams into web socket streams.
         StreamAllocation streamAllocation = Internal.instance.streamAllocation(call);
         streamAllocation.noNewStreams(); // Prevent connection pooling!
-        Streams streams = new ClientStreams(streamAllocation);
+        Streams streams = streamAllocation.connection().newWebSocketStreams(streamAllocation);
 
-        // Process all websocket messages.
+        // Process all web socket messages.
         try {
-          listener.onOpen(RealNewWebSocket.this, response);
-          initReaderAndWriter(streams);
+          listener.onOpen(RealWebSocket.this, response);
+          String name = "OkHttp WebSocket " + request.url().redact();
+          initReaderAndWriter(name, streams);
+          streamAllocation.connection().socket().setSoTimeout(0);
           loopReader();
         } catch (Exception e) {
           failWebSocket(e, null);
@@ -199,7 +222,7 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     });
   }
 
-  private void checkResponse(Response response) throws ProtocolException {
+  void checkResponse(Response response) throws ProtocolException {
     if (response.code() != 101) {
       throw new ProtocolException("Expected HTTP 101 response but was '"
           + response.code() + " " + response.message() + "'");
@@ -226,10 +249,15 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     }
   }
 
-  public void initReaderAndWriter(Streams streams) throws IOException {
+  public void initReaderAndWriter(String name, Streams streams) throws IOException {
     synchronized (this) {
       this.streams = streams;
       this.writer = new WebSocketWriter(streams.client, streams.sink, random);
+      this.executor = new ScheduledThreadPoolExecutor(1, Util.threadFactory(name, false));
+      if (pingIntervalMillis != 0) {
+        executor.scheduleAtFixedRate(
+            new PingRunnable(), pingIntervalMillis, pingIntervalMillis, MILLISECONDS);
+      }
       if (!messageAndCloseQueue.isEmpty()) {
         runWriter(); // Send messages that were enqueued before we were connected.
       }
@@ -238,7 +266,7 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     reader = new WebSocketReader(streams.client, streams.source, this);
   }
 
-  /** Receive frames until there are no more. */
+  /** Receive frames until there are no more. Invoked only by the reader thread. */
   public void loopReader() throws IOException {
     while (receivedCloseCode == -1) {
       // This method call results in one or more onRead* methods being called on this thread.
@@ -246,7 +274,10 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     }
   }
 
-  /** Receive a single frame and return true if there are more frames to read. */
+  /**
+   * For testing: receive a single frame and return true if there are more frames to read. Invoked
+   * only by the reader thread.
+   */
   boolean processNextFrame() throws IOException {
     try {
       reader.processNextFrame();
@@ -257,32 +288,57 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     }
   }
 
-  @Override public void onReadMessage(ResponseBody body) throws IOException {
-    try {
-      if (body.contentType().equals(WebSocket.TEXT)) {
-        String text = body.source().readUtf8();
-        listener.onMessage(this, text);
-      } else if (body.contentType().equals(WebSocket.BINARY)) {
-        ByteString bytes = body.source().readByteString();
-        listener.onMessage(this, bytes);
-      } else {
-        throw new IllegalArgumentException();
-      }
-    } finally {
-      Util.closeQuietly(body);
-    }
+  /**
+   * For testing: wait until the web socket's executor has terminated.
+   */
+  void awaitTermination(int timeout, TimeUnit timeUnit) throws InterruptedException {
+    executor.awaitTermination(timeout, timeUnit);
   }
 
-  @Override public synchronized void onReadPing(final ByteString payload) {
+  /**
+   * For testing: force this web socket to release its threads.
+   */
+  void tearDown() throws InterruptedException {
+    if (cancelFuture != null) {
+      cancelFuture.cancel(false);
+    }
+    executor.shutdown();
+    executor.awaitTermination(10, TimeUnit.SECONDS);
+  }
+
+  synchronized int sentPingCount() {
+    return sentPingCount;
+  }
+
+  synchronized int receivedPingCount() {
+    return receivedPingCount;
+  }
+
+  synchronized int receivedPongCount() {
+    return receivedPongCount;
+  }
+
+  @Override public void onReadMessage(String text) throws IOException {
+    listener.onMessage(this, text);
+  }
+
+  @Override public void onReadMessage(ByteString bytes) throws IOException {
+    listener.onMessage(this, bytes);
+  }
+
+  @Override public synchronized void onReadPing(ByteString payload) {
     // Don't respond to pings after we've failed or sent the close frame.
     if (failed || (enqueuedClose && messageAndCloseQueue.isEmpty())) return;
 
     pongQueue.add(payload);
     runWriter();
+    receivedPingCount++;
   }
 
-  @Override public void onReadPong(ByteString buffer) {
+  @Override public synchronized void onReadPong(ByteString buffer) {
     // This API doesn't expose pings.
+    receivedPongCount++;
+    awaitingPong = false;
   }
 
   @Override public void onReadClose(int code, String reason) {
@@ -296,6 +352,8 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
       if (enqueuedClose && messageAndCloseQueue.isEmpty()) {
         toClose = this.streams;
         this.streams = null;
+        if (cancelFuture != null) cancelFuture.cancel(false);
+        this.executor.shutdown();
       }
     }
 
@@ -339,7 +397,7 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     return true;
   }
 
-  public synchronized boolean pong(ByteString payload) {
+  synchronized boolean pong(ByteString payload) {
     // Don't send pongs after we've failed or sent the close frame.
     if (failed || (enqueuedClose && messageAndCloseQueue.isEmpty())) return false;
 
@@ -348,8 +406,20 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     return true;
   }
 
-  @Override public synchronized boolean close(final int code, final String reason) {
-    // TODO(jwilson): confirm reason is well-formed. (<=123 bytes, etc.)
+  @Override public boolean close(int code, String reason) {
+    return close(code, reason, CANCEL_AFTER_CLOSE_MILLIS);
+  }
+
+  synchronized boolean close(int code, String reason, long cancelAfterCloseMillis) {
+    validateCloseCode(code);
+
+    ByteString reasonBytes = null;
+    if (reason != null) {
+      reasonBytes = ByteString.encodeUtf8(reason);
+      if (reasonBytes.size() > CLOSE_MESSAGE_MAX) {
+        throw new IllegalArgumentException("reason.size() > " + CLOSE_MESSAGE_MAX + ": " + reason);
+      }
+    }
 
     if (failed || enqueuedClose) return false;
 
@@ -357,7 +427,7 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     enqueuedClose = true;
 
     // Enqueue the close frame.
-    messageAndCloseQueue.add(new Close(code, reason));
+    messageAndCloseQueue.add(new Close(code, reasonBytes, cancelAfterCloseMillis));
     runWriter();
     return true;
   }
@@ -365,8 +435,7 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
   private void runWriter() {
     assert (Thread.holdsLock(this));
 
-    if (!writerRunning) {
-      writerRunning = true;
+    if (executor != null) {
       executor.execute(writerRunnable);
     }
   }
@@ -384,7 +453,7 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
    * <p>This method may only be invoked by the writer thread. There may be only thread invoking this
    * method at a time.
    */
-  private boolean writeOneFrame() throws IOException {
+  boolean writeOneFrame() throws IOException {
     WebSocketWriter writer;
     ByteString pong;
     Object messageOrClose = null;
@@ -392,18 +461,12 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     String receivedCloseReason = null;
     Streams streamsToClose = null;
 
-    synchronized (RealNewWebSocket.this) {
+    synchronized (RealWebSocket.this) {
       if (failed) {
-        writerRunning = false;
         return false; // Failed web socket.
       }
 
       writer = this.writer;
-      if (writer == null) {
-        writerRunning = false;
-        return false; // Not yet connected.
-      }
-
       pong = pongQueue.poll();
       if (pong == null) {
         messageOrClose = messageAndCloseQueue.poll();
@@ -413,10 +476,13 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
           if (receivedCloseCode != -1) {
             streamsToClose = this.streams;
             this.streams = null;
+            this.executor.shutdown();
+          } else {
+            // When we request a graceful close also schedule a cancel of the websocket.
+            cancelFuture = executor.schedule(new CancelRunnable(),
+                ((Close) messageOrClose).cancelAfterCloseMillis, MILLISECONDS);
           }
-
         } else if (messageOrClose == null) {
-          writerRunning = false;
           return false; // The queue is exhausted.
         }
       }
@@ -455,13 +521,49 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     }
   }
 
-  private void failWebSocket(Exception e, Response response) {
+  private final class PingRunnable implements Runnable {
+    PingRunnable() {
+    }
+
+    @Override public void run() {
+      writePingFrame();
+    }
+  }
+
+  void writePingFrame() {
+    WebSocketWriter writer;
+    int failedPing;
+    synchronized (this) {
+      if (failed) return;
+      writer = this.writer;
+      failedPing = awaitingPong ? sentPingCount : -1;
+      sentPingCount++;
+      awaitingPong = true;
+    }
+
+    if (failedPing != -1) {
+      failWebSocket(new SocketTimeoutException("sent ping but didn't receive pong within "
+          + pingIntervalMillis + "ms (after " + (failedPing - 1) + " successful ping/pongs)"),
+          null);
+      return;
+    }
+
+    try {
+      writer.writePing(ByteString.EMPTY);
+    } catch (IOException e) {
+      failWebSocket(e, null);
+    }
+  }
+
+  public void failWebSocket(Exception e, @Nullable Response response) {
     Streams streamsToClose;
     synchronized (this) {
       if (failed) return; // Already failed.
       failed = true;
       streamsToClose = this.streams;
       this.streams = null;
+      if (cancelFuture != null) cancelFuture.cancel(false);
+      if (executor != null) executor.shutdown();
     }
 
     try {
@@ -475,7 +577,7 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     final int formatOpcode;
     final ByteString data;
 
-    public Message(int formatOpcode, ByteString data) {
+    Message(int formatOpcode, ByteString data) {
       this.formatOpcode = formatOpcode;
       this.data = data;
     }
@@ -483,18 +585,20 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
 
   static final class Close {
     final int code;
-    final String reason;
+    final ByteString reason;
+    final long cancelAfterCloseMillis;
 
-    public Close(int code, String reason) {
+    Close(int code, ByteString reason, long cancelAfterCloseMillis) {
       this.code = code;
       this.reason = reason;
+      this.cancelAfterCloseMillis = cancelAfterCloseMillis;
     }
   }
 
   public abstract static class Streams implements Closeable {
-    final boolean client;
-    final BufferedSource source;
-    final BufferedSink sink;
+    public final boolean client;
+    public final BufferedSource source;
+    public final BufferedSink sink;
 
     public Streams(boolean client, BufferedSource source, BufferedSink sink) {
       this.client = client;
@@ -503,16 +607,9 @@ public final class RealNewWebSocket implements NewWebSocket, WebSocketReader.Fra
     }
   }
 
-  static final class ClientStreams extends Streams {
-    private final StreamAllocation streamAllocation;
-
-    public ClientStreams(StreamAllocation streamAllocation) {
-      super(true, streamAllocation.connection().source, streamAllocation.connection().sink);
-      this.streamAllocation = streamAllocation;
-    }
-
-    @Override public void close() {
-      streamAllocation.streamFinished(true, streamAllocation.codec());
+  final class CancelRunnable implements Runnable {
+    @Override public void run() {
+      cancel();
     }
   }
 }

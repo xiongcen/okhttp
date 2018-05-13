@@ -18,11 +18,14 @@ package okhttp3.internal.platform;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.List;
+import javax.annotation.Nullable;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.X509TrustManager;
 import okhttp3.Protocol;
+
+import static okhttp3.internal.Util.assertionError;
 
 /**
  * OpenJDK 9+.
@@ -31,7 +34,7 @@ final class Jdk9Platform extends Platform {
   final Method setProtocolMethod;
   final Method getProtocolMethod;
 
-  public Jdk9Platform(Method setProtocolMethod, Method getProtocolMethod) {
+  Jdk9Platform(Method setProtocolMethod, Method getProtocolMethod) {
     this.setProtocolMethod = setProtocolMethod;
     this.getProtocolMethod = getProtocolMethod;
   }
@@ -49,12 +52,12 @@ final class Jdk9Platform extends Platform {
 
       sslSocket.setSSLParameters(sslParameters);
     } catch (IllegalAccessException | InvocationTargetException e) {
-      throw new AssertionError();
+      throw assertionError("unable to set ssl parameters", e);
     }
   }
 
   @Override
-  public String getSelectedProtocol(SSLSocket socket) {
+  public @Nullable String getSelectedProtocol(SSLSocket socket) {
     try {
       String protocol = (String) getProtocolMethod.invoke(socket);
 
@@ -66,7 +69,7 @@ final class Jdk9Platform extends Platform {
 
       return protocol;
     } catch (IllegalAccessException | InvocationTargetException e) {
-      throw new AssertionError();
+      throw assertionError("unable to get selected protocols", e);
     }
   }
 

@@ -1,8 +1,14 @@
 language: java
 
 jdk:
-  - oraclejdk7
   - oraclejdk8
+
+addons:
+  apt:
+    packages:
+      - oracle-java8-installer # Updates JDK 8 to the latest available.
+
+script: mvn test javadoc:jar source:jar -B
 
 after_success:
   - .buildscript/deploy_snapshot.sh
@@ -24,8 +30,3 @@ sudo: false
 cache:
   directories:
     - $HOME/.m2
-
-addons:
-  apt:
-    packages:
-      - oracle-java8-installer

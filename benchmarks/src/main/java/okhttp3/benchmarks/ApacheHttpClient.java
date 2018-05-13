@@ -20,7 +20,7 @@ import java.io.InputStream;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.GZIPInputStream;
 import okhttp3.HttpUrl;
-import okhttp3.internal.tls.SslClient;
+import okhttp3.mockwebserver.internal.tls.SslClient;
 import org.apache.http.Header;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.HttpClient;
@@ -55,7 +55,7 @@ class ApacheHttpClient extends SynchronousHttpClient {
   class ApacheHttpClientRequest implements Runnable {
     private final HttpUrl url;
 
-    public ApacheHttpClientRequest(HttpUrl url) {
+    ApacheHttpClientRequest(HttpUrl url) {
       this.url = url;
     }
 

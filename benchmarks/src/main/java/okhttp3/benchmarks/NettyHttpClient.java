@@ -44,7 +44,7 @@ import java.util.Deque;
 import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLEngine;
 import okhttp3.HttpUrl;
-import okhttp3.internal.tls.SslClient;
+import okhttp3.mockwebserver.internal.tls.SslClient;
 
 /** Netty isn't an HTTP client, but it's almost one. */
 class NettyHttpClient implements HttpClient {
@@ -137,7 +137,7 @@ class NettyHttpClient implements HttpClient {
     int total;
     long start;
 
-    public HttpChannel(SocketChannel channel) {
+    HttpChannel(SocketChannel channel) {
       this.channel = channel;
     }
 

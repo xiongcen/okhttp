@@ -27,8 +27,9 @@ import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLSocketFactory;
 import okhttp3.Address;
+import okhttp3.Call;
 import okhttp3.CertificatePinner;
-import okhttp3.Connection;
+import okhttp3.EventListener;
 import okhttp3.HttpUrl;
 import okhttp3.Interceptor;
 import okhttp3.OkHttpClient;
@@ -38,6 +39,7 @@ import okhttp3.Response;
 import okhttp3.Route;
 import okhttp3.internal.connection.RouteException;
 import okhttp3.internal.connection.StreamAllocation;
+import okhttp3.internal.http2.ConnectionShutdownException;
 
 import static java.net.HttpURLConnection.HTTP_CLIENT_TIMEOUT;
 import static java.net.HttpURLConnection.HTTP_MOVED_PERM;
@@ -46,6 +48,7 @@ import static java.net.HttpURLConnection.HTTP_MULT_CHOICE;
 import static java.net.HttpURLConnection.HTTP_PROXY_AUTH;
 import static java.net.HttpURLConnection.HTTP_SEE_OTHER;
 import static java.net.HttpURLConnection.HTTP_UNAUTHORIZED;
+import static java.net.HttpURLConnection.HTTP_UNAVAILABLE;
 import static okhttp3.internal.Util.closeQuietly;
 import static okhttp3.internal.http.StatusLine.HTTP_PERM_REDIRECT;
 import static okhttp3.internal.http.StatusLine.HTTP_TEMP_REDIRECT;
@@ -63,7 +66,7 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
 
   private final OkHttpClient client;
   private final boolean forWebSocket;
-  private StreamAllocation streamAllocation;
+  private volatile StreamAllocation streamAllocation;
   private Object callStackTrace;
   private volatile boolean canceled;
 
@@ -101,9 +104,13 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
 
   @Override public Response intercept(Chain chain) throws IOException {
     Request request = chain.request();
+    RealInterceptorChain realChain = (RealInterceptorChain) chain;
+    Call call = realChain.call();
+    EventListener eventListener = realChain.eventListener();
 
-    streamAllocation = new StreamAllocation(
-        client.connectionPool(), createAddress(request.url()), callStackTrace);
+    StreamAllocation streamAllocation = new StreamAllocation(client.connectionPool(),
+        createAddress(request.url()), call, eventListener, callStackTrace);
+    this.streamAllocation = streamAllocation;
 
     int followUpCount = 0;
     Response priorResponse = null;
@@ -113,19 +120,22 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
         throw new IOException("Canceled");
       }
 
-      Response response = null;
+      Response response;
       boolean releaseConnection = true;
       try {
-        response = ((RealInterceptorChain) chain).proceed(request, streamAllocation, null, null);
+        response = realChain.proceed(request, streamAllocation, null, null);
         releaseConnection = false;
       } catch (RouteException e) {
         // The attempt to connect via a route failed. The request will not have been sent.
-        if (!recover(e.getLastConnectException(), true, request)) throw e.getLastConnectException();
+        if (!recover(e.getLastConnectException(), streamAllocation, false, request)) {
+          throw e.getLastConnectException();
+        }
         releaseConnection = false;
         continue;
       } catch (IOException e) {
         // An attempt to communicate with a server failed. The request may have been sent.
-        if (!recover(e, false, request)) throw e;
+        boolean requestSendStarted = !(e instanceof ConnectionShutdownException);
+        if (!recover(e, streamAllocation, requestSendStarted, request)) throw e;
         releaseConnection = false;
         continue;
       } finally {
@@ -145,7 +155,13 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
             .build();
       }
 
-      Request followUp = followUpRequest(response);
+      Request followUp;
+      try {
+        followUp = followUpRequest(response, streamAllocation.route());
+      } catch (IOException e) {
+        streamAllocation.release();
+        throw e;
+      }
 
       if (followUp == null) {
         if (!forWebSocket) {
@@ -168,8 +184,9 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
 
       if (!sameConnection(response, followUp.url())) {
         streamAllocation.release();
-        streamAllocation = new StreamAllocation(
-            client.connectionPool(), createAddress(followUp.url()), callStackTrace);
+        streamAllocation = new StreamAllocation(client.connectionPool(),
+            createAddress(followUp.url()), call, eventListener, callStackTrace);
+        this.streamAllocation = streamAllocation;
       } else if (streamAllocation.codec() != null) {
         throw new IllegalStateException("Closing the body of " + response
             + " didn't close its backing stream. Bad interceptor?");
@@ -198,19 +215,21 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
   /**
    * Report and attempt to recover from a failure to communicate with a server. Returns true if
    * {@code e} is recoverable, or false if the failure is permanent. Requests with a body can only
-   * be recovered if the body is buffered.
+   * be recovered if the body is buffered or if the failure occurred before the request has been
+   * sent.
    */
-  private boolean recover(IOException e, boolean routeException, Request userRequest) {
+  private boolean recover(IOException e, StreamAllocation streamAllocation,
+      boolean requestSendStarted, Request userRequest) {
     streamAllocation.streamFailed(e);
 
     // The application layer has forbidden retries.
     if (!client.retryOnConnectionFailure()) return false;
 
     // We can't send the request body again.
-    if (!routeException && userRequest.body() instanceof UnrepeatableRequestBody) return false;
+    if (requestSendStarted && userRequest.body() instanceof UnrepeatableRequestBody) return false;
 
     // This exception is fatal.
-    if (!isRecoverable(e, routeException)) return false;
+    if (!isRecoverable(e, requestSendStarted)) return false;
 
     // No more routes to attempt.
     if (!streamAllocation.hasMoreRoutes()) return false;
@@ -219,7 +238,7 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
     return true;
   }
 
-  private boolean isRecoverable(IOException e, boolean routeException) {
+  private boolean isRecoverable(IOException e, boolean requestSendStarted) {
     // If there was a protocol problem, don't recover.
     if (e instanceof ProtocolException) {
       return false;
@@ -228,7 +247,7 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
     // If there was an interruption don't recover, but if there was a timeout connecting to a route
     // we should try the next route (if there is one).
     if (e instanceof InterruptedIOException) {
-      return e instanceof SocketTimeoutException && routeException;
+      return e instanceof SocketTimeoutException && !requestSendStarted;
     }
 
     // Look for known client-side or negotiation errors that are unlikely to be fixed by trying
@@ -256,12 +275,8 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
    * either add authentication headers, follow redirects or handle a client request timeout. If a
    * follow-up is either unnecessary or not applicable, this returns null.
    */
-  private Request followUpRequest(Response userResponse) throws IOException {
+  private Request followUpRequest(Response userResponse, Route route) throws IOException {
     if (userResponse == null) throw new IllegalStateException();
-    Connection connection = streamAllocation.connection();
-    Route route = connection != null
-        ? connection.route()
-        : null;
     int responseCode = userResponse.code();
 
     final String method = userResponse.request().method();
@@ -334,15 +349,60 @@ public final class RetryAndFollowUpInterceptor implements Interceptor {
         // 408's are rare in practice, but some servers like HAProxy use this response code. The
         // spec says that we may repeat the request without modifications. Modern browsers also
         // repeat the request (even non-idempotent ones.)
+        if (!client.retryOnConnectionFailure()) {
+          // The application layer has directed us not to retry the request.
+          return null;
+        }
+
         if (userResponse.request().body() instanceof UnrepeatableRequestBody) {
+          return null;
+        }
+
+        if (userResponse.priorResponse() != null
+            && userResponse.priorResponse().code() == HTTP_CLIENT_TIMEOUT) {
+          // We attempted to retry and got another timeout. Give up.
+          return null;
+        }
+
+        if (retryAfter(userResponse, 0) > 0) {
           return null;
         }
 
         return userResponse.request();
 
+      case HTTP_UNAVAILABLE:
+        if (userResponse.priorResponse() != null
+            && userResponse.priorResponse().code() == HTTP_UNAVAILABLE) {
+          // We attempted to retry and got another timeout. Give up.
+          return null;
+        }
+
+        if (retryAfter(userResponse, Integer.MAX_VALUE) == 0) {
+          // specifically received an instruction to retry without delay
+          return userResponse.request();
+        }
+
+        return null;
+
       default:
         return null;
     }
+  }
+
+  private int retryAfter(Response userResponse, int defaultDelay) {
+    String header = userResponse.header("Retry-After");
+
+    if (header == null) {
+      return defaultDelay;
+    }
+
+    // https://tools.ietf.org/html/rfc7231#section-7.1.3
+    // currently ignores a HTTP-date, and assumes any non int 0 is a delay
+    if (header.matches("\\d+")) {
+      return Integer.valueOf(header);
+    }
+
+    return Integer.MAX_VALUE;
   }
 
   /**

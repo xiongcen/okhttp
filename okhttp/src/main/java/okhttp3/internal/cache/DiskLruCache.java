@@ -32,6 +32,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.annotation.Nullable;
 import okhttp3.internal.Util;
 import okhttp3.internal.io.FileSystem;
 import okhttp3.internal.platform.Platform;
@@ -136,25 +137,25 @@ public final class DiskLruCache implements Closeable, Flushable {
      * it exists when the cache is opened.
      */
 
-  private final FileSystem fileSystem;
-  private final File directory;
+  final FileSystem fileSystem;
+  final File directory;
   private final File journalFile;
   private final File journalFileTmp;
   private final File journalFileBackup;
   private final int appVersion;
   private long maxSize;
-  private final int valueCount;
+  final int valueCount;
   private long size = 0;
-  private BufferedSink journalWriter;
-  private final LinkedHashMap<String, Entry> lruEntries = new LinkedHashMap<>(0, 0.75f, true);
-  private int redundantOpCount;
-  private boolean hasJournalErrors;
+  BufferedSink journalWriter;
+  final LinkedHashMap<String, Entry> lruEntries = new LinkedHashMap<>(0, 0.75f, true);
+  int redundantOpCount;
+  boolean hasJournalErrors;
 
   // Must be read and written when synchronized on 'this'.
-  private boolean initialized;
-  private boolean closed;
-  private boolean mostRecentTrimFailed;
-  private boolean mostRecentRebuildFailed;
+  boolean initialized;
+  boolean closed;
+  boolean mostRecentTrimFailed;
+  boolean mostRecentRebuildFailed;
 
   /**
    * To differentiate between old and current snapshots, each entry is given a sequence number each
@@ -231,7 +232,13 @@ public final class DiskLruCache implements Closeable, Flushable {
       } catch (IOException journalIsCorrupt) {
         Platform.get().log(WARN, "DiskLruCache " + directory + " is corrupt: "
             + journalIsCorrupt.getMessage() + ", removing", journalIsCorrupt);
+      }
+
+      // The cache is corrupted, attempt to delete the contents of the directory. This can throw and
+      // we'll let that propagate out as it likely means there is a severe filesystem problem.
+      try {
         delete();
+      } finally {
         closed = false;
       }
     }
@@ -381,7 +388,7 @@ public final class DiskLruCache implements Closeable, Flushable {
    * Creates a new journal that omits redundant information. This replaces the current journal if it
    * exists.
    */
-  private synchronized void rebuildJournal() throws IOException {
+  synchronized void rebuildJournal() throws IOException {
     if (journalWriter != null) {
       journalWriter.close();
     }
@@ -448,11 +455,11 @@ public final class DiskLruCache implements Closeable, Flushable {
   /**
    * Returns an editor for the entry named {@code key}, or null if another edit is in progress.
    */
-  public Editor edit(String key) throws IOException {
+  public @Nullable Editor edit(String key) throws IOException {
     return edit(key, ANY_SEQUENCE_NUMBER);
   }
 
-  private synchronized Editor edit(String key, long expectedSequenceNumber) throws IOException {
+  synchronized Editor edit(String key, long expectedSequenceNumber) throws IOException {
     initialize();
 
     checkNotClosed();
@@ -524,7 +531,7 @@ public final class DiskLruCache implements Closeable, Flushable {
     return size;
   }
 
-  private synchronized void completeEdit(Editor editor, boolean success) throws IOException {
+  synchronized void completeEdit(Editor editor, boolean success) throws IOException {
     Entry entry = editor.entry;
     if (entry.currentEditor != editor) {
       throw new IllegalStateException();
@@ -588,7 +595,7 @@ public final class DiskLruCache implements Closeable, Flushable {
    * We only rebuild the journal when it will halve the size of the journal and eliminate at least
    * 2000 ops.
    */
-  private boolean journalRebuildRequired() {
+  boolean journalRebuildRequired() {
     final int redundantOpCompactThreshold = 2000;
     return redundantOpCount >= redundantOpCompactThreshold
         && redundantOpCount >= lruEntries.size();
@@ -612,7 +619,7 @@ public final class DiskLruCache implements Closeable, Flushable {
     return removed;
   }
 
-  private boolean removeEntry(Entry entry) throws IOException {
+  boolean removeEntry(Entry entry) throws IOException {
     if (entry.currentEditor != null) {
       entry.currentEditor.detach(); // Prevent the edit from completing normally.
     }
@@ -672,7 +679,7 @@ public final class DiskLruCache implements Closeable, Flushable {
     closed = true;
   }
 
-  private void trimToSize() throws IOException {
+  void trimToSize() throws IOException {
     while (size > maxSize) {
       Entry toEvict = lruEntries.values().iterator().next();
       removeEntry(toEvict);
@@ -784,7 +791,7 @@ public final class DiskLruCache implements Closeable, Flushable {
     private final Source[] sources;
     private final long[] lengths;
 
-    private Snapshot(String key, long sequenceNumber, Source[] sources, long[] lengths) {
+    Snapshot(String key, long sequenceNumber, Source[] sources, long[] lengths) {
       this.key = key;
       this.sequenceNumber = sequenceNumber;
       this.sources = sources;
@@ -799,7 +806,7 @@ public final class DiskLruCache implements Closeable, Flushable {
      * Returns an editor for this snapshot's entry, or null if either the entry has changed since
      * this snapshot was created or if another edit is in progress.
      */
-    public Editor edit() throws IOException {
+    public @Nullable Editor edit() throws IOException {
       return DiskLruCache.this.edit(key, sequenceNumber);
     }
 
@@ -822,11 +829,11 @@ public final class DiskLruCache implements Closeable, Flushable {
 
   /** Edits the values for an entry. */
   public final class Editor {
-    private final Entry entry;
-    private final boolean[] written;
+    final Entry entry;
+    final boolean[] written;
     private boolean done;
 
-    private Editor(Entry entry) {
+    Editor(Entry entry) {
       this.entry = entry;
       this.written = (entry.readable) ? null : new boolean[valueCount];
     }
@@ -948,23 +955,23 @@ public final class DiskLruCache implements Closeable, Flushable {
   }
 
   private final class Entry {
-    private final String key;
+    final String key;
 
     /** Lengths of this entry's files. */
-    private final long[] lengths;
-    private final File[] cleanFiles;
-    private final File[] dirtyFiles;
+    final long[] lengths;
+    final File[] cleanFiles;
+    final File[] dirtyFiles;
 
     /** True if this entry has ever been published. */
-    private boolean readable;
+    boolean readable;
 
     /** The ongoing edit or null if this entry is not being edited. */
-    private Editor currentEditor;
+    Editor currentEditor;
 
     /** The sequence number of the most recently committed edit to this entry. */
-    private long sequenceNumber;
+    long sequenceNumber;
 
-    private Entry(String key) {
+    Entry(String key) {
       this.key = key;
 
       lengths = new long[valueCount];
@@ -984,7 +991,7 @@ public final class DiskLruCache implements Closeable, Flushable {
     }
 
     /** Set lengths using decimal numbers like "10123". */
-    private void setLengths(String[] strings) throws IOException {
+    void setLengths(String[] strings) throws IOException {
       if (strings.length != valueCount) {
         throw invalidLengths(strings);
       }

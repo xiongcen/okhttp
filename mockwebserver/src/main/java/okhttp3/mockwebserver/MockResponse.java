@@ -19,7 +19,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import okhttp3.Headers;
-import okhttp3.NewWebSocket;
+import okhttp3.WebSocketListener;
 import okhttp3.internal.Internal;
 import okhttp3.internal.http2.Settings;
 import okio.Buffer;
@@ -43,9 +43,12 @@ public final class MockResponse implements Cloneable {
   private long bodyDelayAmount = 0;
   private TimeUnit bodyDelayUnit = TimeUnit.MILLISECONDS;
 
+  private long headersDelayAmount = 0;
+  private TimeUnit headersDelayUnit = TimeUnit.MILLISECONDS;
+
   private List<PushPromise> promises = new ArrayList<>();
   private Settings settings;
-  private NewWebSocket.Listener webSocketListener;
+  private WebSocketListener webSocketListener;
 
   /** Creates a new mock response with an empty body. */
   public MockResponse() {
@@ -253,6 +256,16 @@ public final class MockResponse implements Cloneable {
     return unit.convert(bodyDelayAmount, bodyDelayUnit);
   }
 
+  public MockResponse setHeadersDelay(long delay, TimeUnit unit) {
+    headersDelayAmount = delay;
+    headersDelayUnit = unit;
+    return this;
+  }
+
+  public long getHeadersDelay(TimeUnit unit) {
+    return unit.convert(headersDelayAmount, headersDelayUnit);
+  }
+
   /**
    * When {@link MockWebServer#setProtocols(java.util.List) protocols} include {@linkplain
    * okhttp3.Protocol#HTTP_2}, this attaches a pushed stream to this response.
@@ -284,7 +297,7 @@ public final class MockResponse implements Cloneable {
    * Attempts to perform a web socket upgrade on the connection. This will overwrite any previously
    * set status or body.
    */
-  public MockResponse withWebSocketUpgrade(NewWebSocket.Listener listener) {
+  public MockResponse withWebSocketUpgrade(WebSocketListener listener) {
     setStatus("HTTP/1.1 101 Switching Protocols");
     setHeader("Connection", "Upgrade");
     setHeader("Upgrade", "websocket");
@@ -293,7 +306,7 @@ public final class MockResponse implements Cloneable {
     return this;
   }
 
-  public NewWebSocket.Listener getWebSocketListener() {
+  public WebSocketListener getWebSocketListener() {
     return webSocketListener;
   }
 
